@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import { useMemo, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import {

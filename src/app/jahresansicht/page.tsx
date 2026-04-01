@@ -1,4 +1,4 @@
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import Link from "next/link";
 
 import { Topbar } from "@/components/app/topbar";

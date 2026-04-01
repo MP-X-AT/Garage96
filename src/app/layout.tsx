@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
 import { Inter, Manrope } from "next/font/google";
+import dayjs from "@/lib/dayjs";
+import "dayjs/locale/de";
 import "./globals.css";
+
+dayjs.locale("de");
 
 const inter = Inter({
   variable: "--font-sans",
