@@ -1,4 +1,4 @@
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import type { CalendarBlock } from "@/types/calendar";
 
 type UserColumn = {

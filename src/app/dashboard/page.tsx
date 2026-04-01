@@ -1,5 +1,5 @@
 import Link from "next/link";
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import isoWeek from "dayjs/plugin/isoWeek";
 
 import { Topbar } from "@/components/app/topbar";

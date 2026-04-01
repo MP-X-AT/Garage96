@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import { db } from "@/lib/db";
 import { findNextAvailableSlot } from "@/lib/scheduling";
 

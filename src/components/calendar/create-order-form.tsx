@@ -1,6 +1,6 @@
 "use client";
 
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { getEmployeeTheme, getTaskTheme } from "@/lib/ui-theme";

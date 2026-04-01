@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import type { RowDataPacket } from "mysql2/promise";
 import { db } from "@/lib/db";
 import { rescheduleOrder } from "@/lib/scheduling";

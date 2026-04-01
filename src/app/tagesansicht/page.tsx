@@ -1,10 +1,10 @@
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import isoWeek from "dayjs/plugin/isoWeek";
 import Link from "next/link";
 
 import { Topbar } from "@/components/app/topbar";
-import { CreateOrderForm } from "@/components/calendar/create-order-form";
 import { DayViewClient } from "@/components/calendar/day-view-client";
+import { DayCreateOrderModal } from "@/components/calendar/day-create-order-modal";
 import {
   getAllActiveUsers,
   getCalendarExceptionsForDay,
@@ -43,7 +43,9 @@ export default async function TagesansichtPage({ searchParams }: PageProps) {
           title="Heute"
           subtitle={currentDate.format("dddd, DD.MM.YYYY")}
           primaryAction={{
-            href: `/wochenansicht?week=${currentDate.startOf("isoWeek").format("YYYY-MM-DD")}`,
+            href: `/wochenansicht?week=${currentDate
+              .startOf("isoWeek")
+              .format("YYYY-MM-DD")}`,
             label: "Zur Woche",
           }}
         />
@@ -71,19 +73,15 @@ export default async function TagesansichtPage({ searchParams }: PageProps) {
           </Link>
         </section>
 
-        <div className="grid gap-6 xl:grid-cols-[420px_minmax(0,1fr)]">
-          <div className="space-y-6">
-            <CreateOrderForm date={date} users={users} taskTypes={taskTypes} />
-          </div>
+        <DayCreateOrderModal date={date} users={users} taskTypes={taskTypes} />
 
-          <DayViewClient
-            date={date}
-            users={users}
-            taskTypes={taskTypes}
-            blocks={blocks}
-            exceptions={exceptions}
-          />
-        </div>
+        <DayViewClient
+          date={date}
+          users={users}
+          taskTypes={taskTypes}
+          blocks={blocks}
+          exceptions={exceptions}
+        />
       </div>
     </main>
   );

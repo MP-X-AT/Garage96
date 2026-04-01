@@ -1,6 +1,6 @@
 "use client";
 
-import dayjs from "dayjs";
+import dayjs from "@/lib/dayjs";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { CalendarBlock } from "@/types/calendar";
