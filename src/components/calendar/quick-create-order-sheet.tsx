@@ -13,16 +13,10 @@ type TaskTypeOption = {
   name: string;
 };
 
-type SuggestionBlock = {
+type ConflictItem = {
   start: string;
   end: string;
-  durationMinutes: number;
-};
-
-type SuggestionResponse = {
-  start: string;
-  end: string;
-  blocks: SuggestionBlock[];
+  orderId?: number;
 };
 
 type Props = {
@@ -42,6 +36,17 @@ const DURATIONS = [
   { label: "15h", value: 900 },
 ];
 
+function formatConflictRange(start: string, end: string) {
+  const startDate = dayjs(start);
+  const endDate = dayjs(end);
+
+  if (startDate.format("YYYY-MM-DD") === endDate.format("YYYY-MM-DD")) {
+    return `${startDate.format("DD.MM.YYYY HH:mm")} – ${endDate.format("HH:mm")}`;
+  }
+
+  return `${startDate.format("DD.MM.YYYY HH:mm")} – ${endDate.format("DD.MM.YYYY HH:mm")}`;
+}
+
 export default function QuickCreateOrderSheet({
   users,
   taskTypes,
@@ -55,60 +60,82 @@ export default function QuickCreateOrderSheet({
   const [vehicleInfo, setVehicleInfo] = useState("");
   const [notes, setNotes] = useState("");
   const [price, setPrice] = useState("");
-  const [userId, setUserId] = useState<number | "">("");
-  const [taskTypeId, setTaskTypeId] = useState<number | "">("");
+  const [userId, setUserId] = useState<number | "">(users[0]?.id ?? "");
+  const [taskTypeId, setTaskTypeId] = useState<number | "">(taskTypes[0]?.id ?? "");
   const [date, setDate] = useState(today);
+  const [startTime, setStartTime] = useState("08:00");
   const [durationMinutes, setDurationMinutes] = useState<number>(120);
 
-  const [loadingSuggestion, setLoadingSuggestion] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [suggestion, setSuggestion] = useState<SuggestionResponse | null>(null);
+  const [warning, setWarning] = useState("");
+  const [conflicts, setConflicts] = useState<ConflictItem[]>([]);
+  const [pendingPayload, setPendingPayload] = useState<Record<string, unknown> | null>(null);
 
-  async function loadSuggestion() {
-    setError("");
-    setSuggestion(null);
+  function buildPayload(forceSave = false) {
+    const selectedTask = taskTypes.find((type) => type.id === taskTypeId);
+    return {
+      customerName: customerName.trim(),
+      phone: phone.trim(),
+      title: title.trim() || selectedTask?.name || "Auftrag",
+      vehicleInfo: vehicleInfo.trim(),
+      notes: notes.trim(),
+      price: price ? Number(price) : null,
+      userId,
+      taskTypeId,
+      durationMinutes,
+      date,
+      start: `${date} ${startTime}:00`,
+      forceSave,
+    };
+  }
 
-    if (!userId) {
-      setError("Bitte Mitarbeiter:in auswählen.");
+  async function submitPayload(payload: Record<string, unknown>) {
+    const res = await fetch("/api/orders/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await res.json();
+
+    if (res.ok && data.success) {
+      setCustomerName("");
+      setPhone("");
+      setTitle("");
+      setVehicleInfo("");
+      setNotes("");
+      setPrice("");
+      setUserId(users[0]?.id ?? "");
+      setTaskTypeId(taskTypes[0]?.id ?? "");
+      setDate(today);
+      setStartTime("08:00");
+      setDurationMinutes(120);
+      setWarning("");
+      setConflicts([]);
+      setPendingPayload(null);
+      onCreated?.();
       return;
     }
 
-    setLoadingSuggestion(true);
-
-    try {
-      const res = await fetch("/api/schedule/suggest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId, durationMinutes, date }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok || !data.success) {
-        throw new Error(
-          data.error || "Planungsvorschlag konnte nicht geladen werden."
-        );
-      }
-
-      setSuggestion(data.suggestion);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unbekannter Fehler");
-    } finally {
-      setLoadingSuggestion(false);
+    if (data?.requiresConfirmation) {
+      setWarning(data.warning || "Es gibt einen Planungskonflikt.");
+      setConflicts(Array.isArray(data.conflicts) ? data.conflicts : []);
+      setPendingPayload(payload);
+      return;
     }
+
+    throw new Error(data?.error || "Auftrag konnte nicht erstellt werden.");
   }
 
   async function createOrder() {
     setError("");
+    setWarning("");
+    setConflicts([]);
+    setPendingPayload(null);
 
     if (!customerName.trim()) {
       setError("Bitte Kund:in angeben.");
-      return;
-    }
-
-    if (!title.trim()) {
-      setError("Bitte Titel angeben.");
       return;
     }
 
@@ -122,51 +149,25 @@ export default function QuickCreateOrderSheet({
       return;
     }
 
-    if (!suggestion) {
-      setError("Bitte zuerst einen Planungsvorschlag laden.");
-      return;
-    }
-
     setSaving(true);
 
     try {
-      const res = await fetch("/api/orders/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          customerName,
-          phone,
-          title,
-          vehicleInfo,
-          notes,
-          price: price ? Number(price) : null,
-          userId,
-          taskTypeId,
-          durationMinutes,
-          date,
-          start: suggestion.start,
-        }),
-      });
+      await submitPayload(buildPayload(false));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unbekannter Fehler");
+    } finally {
+      setSaving(false);
+    }
+  }
 
-      const data = await res.json();
+  async function confirmCreateDespiteConflict() {
+    if (!pendingPayload) return;
 
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || "Auftrag konnte nicht erstellt werden.");
-      }
+    setSaving(true);
+    setError("");
 
-      setCustomerName("");
-      setPhone("");
-      setTitle("");
-      setVehicleInfo("");
-      setNotes("");
-      setPrice("");
-      setUserId("");
-      setTaskTypeId("");
-      setDate(today);
-      setDurationMinutes(120);
-      setSuggestion(null);
-
-      onCreated?.();
+    try {
+      await submitPayload({ ...pendingPayload, forceSave: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unbekannter Fehler");
     } finally {
@@ -179,7 +180,7 @@ export default function QuickCreateOrderSheet({
       <div>
         <h2 className="text-lg font-semibold">Schnellplaner</h2>
         <p className="text-sm text-neutral-500">
-          Person wählen, Datum wählen, Vorschlag holen, speichern.
+          Manuell planen, Konflikte prüfen, bei Bedarf trotzdem speichern.
         </p>
       </div>
 
@@ -200,7 +201,7 @@ export default function QuickCreateOrderSheet({
 
         <input
           className="rounded-xl border px-3 py-3"
-          placeholder="Titel"
+          placeholder="Titel (optional)"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
         />
@@ -251,6 +252,13 @@ export default function QuickCreateOrderSheet({
 
         <input
           className="rounded-xl border px-3 py-3"
+          type="time"
+          value={startTime}
+          onChange={(e) => setStartTime(e.target.value)}
+        />
+
+        <input
+          className="rounded-xl border px-3 py-3 md:col-span-2"
           type="number"
           min="0"
           step="0.01"
@@ -292,17 +300,8 @@ export default function QuickCreateOrderSheet({
       <div className="flex flex-col gap-2 sm:flex-row">
         <button
           type="button"
-          onClick={loadSuggestion}
-          disabled={loadingSuggestion}
-          className="rounded-xl bg-neutral-900 px-4 py-3 text-white disabled:opacity-50"
-        >
-          {loadingSuggestion ? "Berechne..." : "Vorschlag laden"}
-        </button>
-
-        <button
-          type="button"
           onClick={createOrder}
-          disabled={saving || !suggestion}
+          disabled={saving}
           className="rounded-xl bg-blue-600 px-4 py-3 text-white disabled:opacity-50"
         >
           {saving ? "Speichert..." : "Auftrag anlegen"}
@@ -315,25 +314,44 @@ export default function QuickCreateOrderSheet({
         </div>
       ) : null}
 
-      {suggestion ? (
-        <div className="rounded-2xl border bg-neutral-50 p-4">
-          <div className="mb-2 font-medium">Planungsvorschlag</div>
+      {warning ? (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-900">
+          <div className="font-semibold">{warning}</div>
 
-          <div className="space-y-2 text-sm">
-            {suggestion.blocks.map((block, index) => (
-              <div
-                key={`${block.start}-${index}`}
-                className="rounded-xl border bg-white px-3 py-2"
-              >
-                <div>
-                  {dayjs(block.start).format("DD.MM.YYYY HH:mm")} –{" "}
-                  {dayjs(block.end).format("HH:mm")}
+          {conflicts.length > 0 ? (
+            <div className="mt-3 space-y-2">
+              {conflicts.map((conflict, index) => (
+                <div
+                  key={`${conflict.start}-${conflict.end}-${index}`}
+                  className="rounded-xl border border-amber-200 bg-white px-3 py-2"
+                >
+                  {formatConflictRange(conflict.start, conflict.end)}
                 </div>
-                <div className="text-neutral-500">
-                  {Math.round((block.durationMinutes / 60) * 100) / 100}h
-                </div>
-              </div>
-            ))}
+              ))}
+            </div>
+          ) : null}
+
+          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={confirmCreateDespiteConflict}
+              disabled={saving}
+              className="rounded-xl bg-amber-600 px-4 py-3 text-white disabled:opacity-50"
+            >
+              {saving ? "Speichert..." : "Trotzdem speichern"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setWarning("");
+                setConflicts([]);
+                setPendingPayload(null);
+              }}
+              className="rounded-xl border bg-white px-4 py-3 text-slate-700"
+            >
+              Abbrechen
+            </button>
           </div>
         </div>
       ) : null}

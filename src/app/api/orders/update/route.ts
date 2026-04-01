@@ -2,7 +2,53 @@ import { NextRequest, NextResponse } from "next/server";
 import dayjs from "@/lib/dayjs";
 import type { RowDataPacket } from "mysql2/promise";
 import { db } from "@/lib/db";
-import { rescheduleOrder } from "@/lib/scheduling";
+import {
+  getExistingBlocksForUserFromDate,
+  overlaps,
+  splitIntoWorkingBlocks,
+  syncOrderPlanningFields,
+} from "@/lib/scheduling";
+
+type ExistingBusyBlock = {
+  id: number;
+  orderId: number;
+  userId: number;
+  taskTypeId: number | null;
+  start: dayjs.Dayjs;
+  end: dayjs.Dayjs;
+  status: "geplant" | "in_arbeit" | "pausiert" | "erledigt";
+  source: "manual" | "auto";
+  notes: string | null;
+};
+
+function buildConflictPayload(
+  plannedBlocks: { start: string; end: string }[],
+  existing: ExistingBusyBlock[]
+) {
+  const conflicts: { start: string; end: string; orderId?: number }[] = [];
+
+  for (const block of plannedBlocks) {
+    const plannedStart = dayjs(block.start);
+    const plannedEnd = dayjs(block.end);
+
+    for (const busy of existing) {
+      if (overlaps(plannedStart, plannedEnd, busy.start, busy.end)) {
+        conflicts.push({
+          start: busy.start.format("YYYY-MM-DD HH:mm:ss"),
+          end: busy.end.format("YYYY-MM-DD HH:mm:ss"),
+          orderId: busy.orderId,
+        });
+      }
+    }
+  }
+
+  const unique = new Map<string, { start: string; end: string; orderId?: number }>();
+  for (const item of conflicts) {
+    unique.set(`${item.start}-${item.end}-${item.orderId ?? ""}`, item);
+  }
+
+  return Array.from(unique.values());
+}
 
 export async function POST(req: NextRequest) {
   const connection = await db.getConnection();
@@ -11,6 +57,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     const orderId = Number(body.orderId);
+    const forceSave = Boolean(body.forceSave);
 
     if (!orderId || Number.isNaN(orderId)) {
       return NextResponse.json(
@@ -78,20 +125,134 @@ export async function POST(req: NextRequest) {
         ? Number(body.durationHours) * 60
         : null;
 
-    const date =
-      body.date !== undefined && body.date !== null && body.date !== ""
-        ? String(body.date)
-        : null;
-
-    const startHour =
-      body.startHour !== undefined &&
-      body.startHour !== null &&
-      body.startHour !== ""
-        ? Number(body.startHour)
-        : null;
-
     const explicitStart =
       body.start && dayjs(body.start).isValid() ? dayjs(body.start) : null;
+
+    const shouldReschedule =
+      userId !== null || taskTypeId !== null || durationMinutes !== null || explicitStart !== null;
+
+    let plannedBlocks:
+      | {
+          start: string;
+          end: string;
+          durationMinutes: number;
+        }[]
+      | null = null;
+
+    let effectiveUserId: number | null = userId;
+    let effectiveDurationMinutes: number | null = durationMinutes;
+    let effectiveStart = explicitStart;
+
+    if (shouldReschedule) {
+      if (effectiveUserId == null) {
+        const [assignmentRows] = await connection.query<
+          (RowDataPacket & { user_id: number })[]
+        >(
+          `
+            SELECT user_id
+            FROM order_assignments
+            WHERE order_id = ? AND is_primary = 1
+            LIMIT 1
+          `,
+          [orderId]
+        );
+
+        if (!assignmentRows.length || !assignmentRows[0].user_id) {
+          return NextResponse.json(
+            { success: false, error: "Bitte Mitarbeiter:in auswählen." },
+            { status: 400 }
+          );
+        }
+
+        effectiveUserId = Number(assignmentRows[0].user_id);
+      }
+
+      if (
+        effectiveDurationMinutes == null ||
+        Number.isNaN(effectiveDurationMinutes) ||
+        effectiveDurationMinutes <= 0
+      ) {
+        const [durationRows] = await connection.query<
+          (RowDataPacket & { estimated_duration_minutes: number | null })[]
+        >(
+          `
+            SELECT estimated_duration_minutes
+            FROM orders
+            WHERE id = ?
+            LIMIT 1
+          `,
+          [orderId]
+        );
+
+        effectiveDurationMinutes = Number(
+          durationRows[0]?.estimated_duration_minutes ?? 0
+        );
+      }
+
+      if (
+        effectiveDurationMinutes == null ||
+        Number.isNaN(effectiveDurationMinutes) ||
+        effectiveDurationMinutes <= 0
+      ) {
+        return NextResponse.json(
+          { success: false, error: "Bitte gültige Dauer angeben." },
+          { status: 400 }
+        );
+      }
+
+      if (!effectiveStart) {
+        const [startRows] = await connection.query<
+          (RowDataPacket & { block_start: string })[]
+        >(
+          `
+            SELECT block_start
+            FROM schedule_blocks
+            WHERE order_id = ?
+            ORDER BY block_start ASC
+            LIMIT 1
+          `,
+          [orderId]
+        );
+
+        if (!startRows.length || !dayjs(startRows[0].block_start).isValid()) {
+          return NextResponse.json(
+            { success: false, error: "Gültige Startzeit ist erforderlich." },
+            { status: 400 }
+          );
+        }
+
+        effectiveStart = dayjs(startRows[0].block_start);
+      }
+
+      plannedBlocks = await splitIntoWorkingBlocks(
+        connection,
+        effectiveStart.format("YYYY-MM-DD HH:mm:ss"),
+        effectiveDurationMinutes
+      );
+
+      const existing = (await getExistingBlocksForUserFromDate(
+        connection,
+        effectiveUserId,
+        effectiveStart.format("YYYY-MM-DD"),
+        orderId
+      )) as ExistingBusyBlock[];
+
+      const conflicts = buildConflictPayload(plannedBlocks, existing);
+
+      if (conflicts.length > 0 && !forceSave) {
+        return NextResponse.json(
+          {
+            success: false,
+            requiresConfirmation: true,
+            warning:
+              "Für diese Person gibt es im gewählten Zeitraum bereits geplante Blöcke.",
+            conflicts,
+            plannedBlocks,
+          },
+          { status: 409 }
+        );
+      }
+    }
 
     await connection.beginTransaction();
 
@@ -144,124 +305,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const shouldReschedule =
-      userId !== null ||
-      taskTypeId !== null ||
-      durationMinutes !== null ||
-      (date !== null && startHour !== null) ||
-      explicitStart !== null;
-
-    if (shouldReschedule) {
-      let effectiveUserId = userId;
-      let effectiveDurationMinutes = durationMinutes;
-      let effectiveStart = explicitStart;
-
-      if (effectiveUserId == null) {
-        const [assignmentRows] = await connection.query<
-          (RowDataPacket & { user_id: number })[]
-        >(
-          `
-            SELECT user_id
-            FROM order_assignments
-            WHERE order_id = ? AND is_primary = 1
-            LIMIT 1
-          `,
-          [orderId]
-        );
-
-        if (!assignmentRows.length || !assignmentRows[0].user_id) {
-          await connection.rollback();
-          return NextResponse.json(
-            { success: false, error: "Bitte Mitarbeiter:in auswählen." },
-            { status: 400 }
-          );
-        }
-
-        effectiveUserId = Number(assignmentRows[0].user_id);
-      }
-
-      if (
-        effectiveDurationMinutes == null ||
-        Number.isNaN(effectiveDurationMinutes) ||
-        effectiveDurationMinutes <= 0
-      ) {
-        const [durationRows] = await connection.query<
-          (RowDataPacket & { estimated_duration_minutes: number | null })[]
-        >(
-          `
-            SELECT estimated_duration_minutes
-            FROM orders
-            WHERE id = ?
-            LIMIT 1
-          `,
-          [orderId]
-        );
-
-        effectiveDurationMinutes = Number(
-          durationRows[0]?.estimated_duration_minutes ?? 0
-        );
-      }
-
-      if (
-        effectiveDurationMinutes == null ||
-        Number.isNaN(effectiveDurationMinutes) ||
-        effectiveDurationMinutes <= 0
-      ) {
-        await connection.rollback();
-        return NextResponse.json(
-          { success: false, error: "Bitte gültige Dauer angeben." },
-          { status: 400 }
-        );
-      }
-
-      if (!effectiveStart) {
-        if (
-          date &&
-          dayjs(date, "YYYY-MM-DD", true).isValid() &&
-          startHour !== null &&
-          !Number.isNaN(startHour)
-        ) {
-          effectiveStart = dayjs(
-            `${date} ${String(startHour).padStart(2, "0")}:00:00`
-          );
-        } else {
-          const [startRows] = await connection.query<
-            (RowDataPacket & { block_start: string })[]
-          >(
-            `
-              SELECT block_start
-              FROM schedule_blocks
-              WHERE order_id = ?
-              ORDER BY block_start ASC
-              LIMIT 1
-            `,
-            [orderId]
-          );
-
-          if (!startRows.length || !dayjs(startRows[0].block_start).isValid()) {
-            await connection.rollback();
-            return NextResponse.json(
-              { success: false, error: "Ungültiges Datum." },
-              { status: 400 }
-            );
-          }
-
-          effectiveStart = dayjs(startRows[0].block_start);
-        }
-      }
-
-      const safeUserId: number = effectiveUserId;
-      const safeDurationMinutes: number = effectiveDurationMinutes;
-
-      await rescheduleOrder(connection, {
-        orderId,
-        userId: safeUserId,
-        taskTypeId: taskTypeId ?? undefined,
-        start: effectiveStart.format("YYYY-MM-DD HH:mm:ss"),
-        durationMinutes: safeDurationMinutes,
-        notes: notes ?? null,
-      });
-    } else if (taskTypeId !== null) {
+    if (taskTypeId !== null) {
       await connection.query(`DELETE FROM order_task_types WHERE order_id = ?`, [
         orderId,
       ]);
@@ -269,22 +313,104 @@ export async function POST(req: NextRequest) {
       await connection.query(
         `
           INSERT INTO order_task_types (order_id, task_type_id, estimated_duration_minutes, notes)
-          VALUES (
-            ?,
-            ?,
-            (SELECT estimated_duration_minutes FROM orders WHERE id = ?),
-            NULL
-          )
+          VALUES (?, ?, ?, NULL)
         `,
-        [orderId, taskTypeId, orderId]
+        [
+          orderId,
+          taskTypeId,
+          effectiveDurationMinutes ?? (
+            await (async () => {
+              const [rows] = await connection.query<
+                (RowDataPacket & { estimated_duration_minutes: number | null })[]
+              >(
+                `
+                  SELECT estimated_duration_minutes
+                  FROM orders
+                  WHERE id = ?
+                  LIMIT 1
+                `,
+                [orderId]
+              );
+              return Number(rows[0]?.estimated_duration_minutes ?? 0);
+            })()
+          ),
+        ]
       );
     }
 
+    if (shouldReschedule && plannedBlocks && effectiveUserId && effectiveDurationMinutes) {
+      await connection.query(`DELETE FROM schedule_blocks WHERE order_id = ?`, [orderId]);
+
+      for (const block of plannedBlocks) {
+        await connection.query(
+          `
+            INSERT INTO schedule_blocks (
+              order_id,
+              user_id,
+              task_type_id,
+              block_start,
+              block_end,
+              status,
+              source,
+              notes
+            ) VALUES (?, ?, ?, ?, ?, 'geplant', 'manual', ?)
+          `,
+          [
+            orderId,
+            effectiveUserId,
+            taskTypeId ?? null,
+            block.start,
+            block.end,
+            notes ?? null,
+          ]
+        );
+      }
+
+      await connection.query(
+        `
+          UPDATE order_assignments
+          SET is_primary = CASE WHEN user_id = ? THEN 1 ELSE 0 END
+          WHERE order_id = ?
+        `,
+        [effectiveUserId, orderId]
+      );
+
+      const [assignmentRows] = await connection.query<
+        (RowDataPacket & { cnt: number })[]
+      >(
+        `
+          SELECT COUNT(*) AS cnt
+          FROM order_assignments
+          WHERE order_id = ? AND user_id = ?
+        `,
+        [orderId, effectiveUserId]
+      );
+
+      if (!assignmentRows[0] || assignmentRows[0].cnt === 0) {
+        await connection.query(
+          `
+            INSERT INTO order_assignments (order_id, user_id, role_label, is_primary)
+            VALUES (?, ?, 'zuständig', 1)
+          `,
+          [orderId, effectiveUserId]
+        );
+      }
+    }
+
+    await syncOrderPlanningFields(connection, orderId);
     await connection.commit();
 
-    return NextResponse.json({ success: true });
+    return NextResponse.json({
+      success: true,
+      warning:
+        shouldReschedule && plannedBlocks
+          ? "Änderung gespeichert."
+          : null,
+    });
   } catch (error) {
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch {}
 
     const message =
       error instanceof Error ? error.message : "Unbekannter Fehler";

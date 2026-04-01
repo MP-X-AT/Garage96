@@ -2,7 +2,53 @@ import { NextRequest, NextResponse } from "next/server";
 import dayjs from "@/lib/dayjs";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { db } from "@/lib/db";
-import { createOrderBlocks, findNextAvailableSlot } from "@/lib/scheduling";
+import {
+  getExistingBlocksForUserFromDate,
+  overlaps,
+  splitIntoWorkingBlocks,
+  syncOrderPlanningFields,
+} from "@/lib/scheduling";
+
+type ExistingBusyBlock = {
+  id: number;
+  orderId: number;
+  userId: number;
+  taskTypeId: number | null;
+  start: dayjs.Dayjs;
+  end: dayjs.Dayjs;
+  status: "geplant" | "in_arbeit" | "pausiert" | "erledigt";
+  source: "manual" | "auto";
+  notes: string | null;
+};
+
+function buildConflictPayload(
+  plannedBlocks: { start: string; end: string }[],
+  existing: ExistingBusyBlock[]
+) {
+  const conflicts: { start: string; end: string; orderId?: number }[] = [];
+
+  for (const block of plannedBlocks) {
+    const plannedStart = dayjs(block.start);
+    const plannedEnd = dayjs(block.end);
+
+    for (const busy of existing) {
+      if (overlaps(plannedStart, plannedEnd, busy.start, busy.end)) {
+        conflicts.push({
+          start: busy.start.format("YYYY-MM-DD HH:mm:ss"),
+          end: busy.end.format("YYYY-MM-DD HH:mm:ss"),
+          orderId: busy.orderId,
+        });
+      }
+    }
+  }
+
+  const unique = new Map<string, { start: string; end: string; orderId?: number }>();
+  for (const item of conflicts) {
+    unique.set(`${item.start}-${item.end}-${item.orderId ?? ""}`, item);
+  }
+
+  return Array.from(unique.values());
+}
 
 export async function POST(req: NextRequest) {
   const connection = await db.getConnection();
@@ -17,6 +63,7 @@ export async function POST(req: NextRequest) {
     const vehicleInfo = String(body.vehicleInfo || "").trim();
     const licensePlate = String(body.licensePlate || "").trim();
     const notes = String(body.notes || "").trim();
+    const forceSave = Boolean(body.forceSave);
 
     const price =
       body.price !== undefined && body.price !== null && body.price !== ""
@@ -38,6 +85,7 @@ export async function POST(req: NextRequest) {
         : null;
 
     const date = String(body.date || "").trim();
+    const startRaw = String(body.start || "").trim();
 
     if (!customerName) {
       return NextResponse.json(
@@ -74,7 +122,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!title && taskTypeId && !Number.isNaN(taskTypeId)) {
+    if (!startRaw || !dayjs(startRaw).isValid()) {
+      return NextResponse.json(
+        { success: false, error: "Gültige Startzeit ist erforderlich." },
+        { status: 400 }
+      );
+    }
+
+    if (!title) {
       const [taskTypeRows] = await connection.query<(RowDataPacket & { name: string })[]>(
         `
           SELECT name
@@ -86,6 +141,31 @@ export async function POST(req: NextRequest) {
       );
 
       title = taskTypeRows[0]?.name?.trim() || "Auftrag";
+    }
+
+    const start = dayjs(startRaw).format("YYYY-MM-DD HH:mm:ss");
+    const plannedBlocks = await splitIntoWorkingBlocks(connection, start, durationMinutes);
+
+    const existing = (await getExistingBlocksForUserFromDate(
+      connection,
+      userId,
+      dayjs(start).format("YYYY-MM-DD")
+    )) as ExistingBusyBlock[];
+
+    const conflicts = buildConflictPayload(plannedBlocks, existing);
+
+    if (conflicts.length > 0 && !forceSave) {
+      return NextResponse.json(
+        {
+          success: false,
+          requiresConfirmation: true,
+          warning:
+            "Für diese Person gibt es im gewählten Zeitraum bereits geplante Blöcke.",
+          conflicts,
+          plannedBlocks,
+        },
+        { status: 409 }
+      );
     }
 
     await connection.beginTransaction();
@@ -135,48 +215,8 @@ export async function POST(req: NextRequest) {
       customerId = customerResult.insertId;
     }
 
-    let start: string;
-
-    if (body.start && dayjs(body.start).isValid()) {
-      start = dayjs(body.start).format("YYYY-MM-DD HH:mm:ss");
-    } else if (
-      body.startHour !== undefined &&
-      body.startHour !== null &&
-      body.startHour !== ""
-    ) {
-      const startHour = Number(body.startHour);
-
-      if (Number.isNaN(startHour)) {
-        await connection.rollback();
-        return NextResponse.json(
-          { success: false, error: "Ungültige Startzeit." },
-          { status: 400 }
-        );
-      }
-
-      start = dayjs(
-        `${date} ${String(startHour).padStart(2, "0")}:00:00`
-      ).format("YYYY-MM-DD HH:mm:ss");
-    } else {
-      const suggestion = await findNextAvailableSlot({
-        connection,
-        userId,
-        durationMinutes,
-        startDate: date,
-      });
-
-      start = suggestion.start;
-    }
-
-    const plannedBlocksPreview = await findNextAvailableSlot({
-      connection,
-      userId,
-      durationMinutes,
-      startDate: dayjs(start).format("YYYY-MM-DD"),
-    });
-
-    const plannedStart = plannedBlocksPreview.start;
-    const plannedEnd = plannedBlocksPreview.end;
+    const plannedStart = plannedBlocks[0].start;
+    const plannedEnd = plannedBlocks[plannedBlocks.length - 1].end;
 
     const [orderResult] = await connection.query<ResultSetHeader>(
       `
@@ -228,26 +268,47 @@ export async function POST(req: NextRequest) {
       [orderId, userId]
     );
 
-    const blocks = await createOrderBlocks(connection, {
-      orderId,
-      userId,
-      taskTypeId,
-      start,
-      durationMinutes,
-      source: body.start ? "manual" : "auto",
-      status: "geplant",
-      notes: notes || null,
-    });
+    for (const block of plannedBlocks) {
+      await connection.query(
+        `
+          INSERT INTO schedule_blocks (
+            order_id,
+            user_id,
+            task_type_id,
+            block_start,
+            block_end,
+            status,
+            source,
+            notes
+          ) VALUES (?, ?, ?, ?, ?, 'geplant', 'manual', ?)
+        `,
+        [
+          orderId,
+          userId,
+          taskTypeId,
+          block.start,
+          block.end,
+          notes || null,
+        ]
+      );
+    }
 
+    await syncOrderPlanningFields(connection, orderId);
     await connection.commit();
 
     return NextResponse.json({
       success: true,
       orderId,
-      blocks,
+      blocks: plannedBlocks,
+      warning:
+        conflicts.length > 0
+          ? "Es gab Planungskonflikte, der Auftrag wurde aber bewusst gespeichert."
+          : null,
     });
   } catch (error) {
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch {}
 
     const message =
       error instanceof Error ? error.message : "Unbekannter Fehler";

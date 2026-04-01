@@ -16,16 +16,25 @@ type TaskTypeOption = {
   color: string | null;
 };
 
-type SuggestionBlock = {
+type ConflictItem = {
   start: string;
   end: string;
-  durationMinutes: number;
+  orderId?: number;
 };
 
-type SuggestionResponse = {
+type PendingPayload = {
+  customerName: string;
+  phone: string;
+  title: string;
+  vehicleInfo: string;
+  price: number | null;
+  taskTypeId: number;
+  userId: number;
+  date: string;
   start: string;
-  end: string;
-  blocks: SuggestionBlock[];
+  durationMinutes: number;
+  notes: string;
+  forceSave?: boolean;
 };
 
 type CreateOrderFormProps = {
@@ -45,7 +54,7 @@ const DURATION_OPTIONS = [
   { label: "15h", value: 900 },
 ];
 
-function formatPreviewRange(start: string, end: string) {
+function formatConflictRange(start: string, end: string) {
   const startDate = dayjs(start);
   const endDate = dayjs(end);
 
@@ -77,14 +86,16 @@ export function CreateOrderForm({
   const [taskTypeId, setTaskTypeId] = useState(initialTaskTypeId);
   const [userId, setUserId] = useState(initialUserId);
   const [selectedDate, setSelectedDate] = useState(date);
+  const [startTime, setStartTime] = useState("08:00");
   const [durationMinutes, setDurationMinutes] = useState(120);
   const [notes, setNotes] = useState("");
 
-  const [suggestion, setSuggestion] = useState<SuggestionResponse | null>(null);
-  const [loadingSuggestion, setLoadingSuggestion] = useState(false);
   const [saving, setSaving] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
+  const [conflicts, setConflicts] = useState<ConflictItem[]>([]);
+  const [pendingPayload, setPendingPayload] = useState<PendingPayload | null>(null);
 
   const selectedUser = users.find((item) => String(item.id) === userId);
   const selectedTask = taskTypes.find((item) => String(item.id) === taskTypeId);
@@ -99,88 +110,38 @@ export function CreateOrderForm({
     taskColor: selectedTask?.color,
   });
 
-  async function loadSuggestion() {
-    setError(null);
-    setSuggestion(null);
+  function buildPayload(forceSave = false): PendingPayload {
+    const effectiveTitle = title.trim() || selectedTask?.name || "Auftrag";
 
-    if (!userId) {
-      setError("Bitte zuerst eine Person auswählen.");
-      return;
-    }
-
-    if (!selectedDate) {
-      setError("Bitte ein Datum auswählen.");
-      return;
-    }
-
-    try {
-      setLoadingSuggestion(true);
-
-      const response = await fetch("/api/schedule/suggest", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          userId: Number(userId),
-          durationMinutes,
-          date: selectedDate,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok || !result.success) {
-        throw new Error(
-          result.error || "Planungsvorschlag konnte nicht geladen werden."
-        );
-      }
-
-      setSuggestion(result.suggestion);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Planungsvorschlag konnte nicht geladen werden."
-      );
-    } finally {
-      setLoadingSuggestion(false);
-    }
+    return {
+      customerName: customerName.trim(),
+      phone: customerPhone.trim(),
+      title: effectiveTitle,
+      vehicleInfo: vehicleInfo.trim(),
+      price: price === "" ? null : Number(price),
+      taskTypeId: Number(taskTypeId),
+      userId: Number(userId),
+      date: selectedDate,
+      start: `${selectedDate} ${startTime}:00`,
+      durationMinutes,
+      notes: notes.trim(),
+      forceSave,
+    };
   }
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setSaving(true);
-    setError(null);
+  async function submitPayload(payload: PendingPayload) {
+    const response = await fetch("/api/orders/create", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
 
-    try {
-      const response = await fetch("/api/orders/create", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          customerName,
-          phone: customerPhone,
-          title,
-          vehicleInfo,
-          price: price === "" ? null : Number(price),
-          taskTypeId: Number(taskTypeId),
-          userId: Number(userId),
-          date: selectedDate,
-          durationMinutes,
-          notes,
-          start: suggestion?.start ?? undefined,
-        }),
-      });
+    const result = await response.json();
 
-      const result = await response.json();
-
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || "Auftrag konnte nicht angelegt werden.");
-      }
-
-      const newDate = selectedDate;
+    if (response.ok && result.success) {
+      const newDate = payload.date;
 
       setCustomerName("");
       setCustomerPhone("");
@@ -189,13 +150,69 @@ export function CreateOrderForm({
       setPrice("");
       setTaskTypeId(String(taskTypes[0]?.id ?? ""));
       setUserId(String(users[0]?.id ?? ""));
+      setSelectedDate(date);
+      setStartTime("08:00");
       setDurationMinutes(120);
       setNotes("");
-      setSuggestion(null);
       setShowAdvanced(false);
+      setWarning(null);
+      setConflicts([]);
+      setPendingPayload(null);
 
       router.push(`/tagesansicht?date=${newDate}`);
       router.refresh();
+      return;
+    }
+
+    if (result?.requiresConfirmation) {
+      setWarning(result.warning || "Es gibt einen Planungskonflikt.");
+      setConflicts(Array.isArray(result.conflicts) ? result.conflicts : []);
+      setPendingPayload(payload);
+      return;
+    }
+
+    throw new Error(result?.error || "Auftrag konnte nicht angelegt werden.");
+  }
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    setWarning(null);
+    setConflicts([]);
+    setPendingPayload(null);
+
+    try {
+      const payload = buildPayload(false);
+
+      if (!payload.customerName) {
+        throw new Error("Bitte Kund:in angeben.");
+      }
+
+      if (!payload.userId) {
+        throw new Error("Bitte Mitarbeiter:in auswählen.");
+      }
+
+      if (!payload.taskTypeId) {
+        throw new Error("Bitte Arbeitsart auswählen.");
+      }
+
+      await submitPayload(payload);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Fehler beim Speichern.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmSaveDespiteConflict() {
+    if (!pendingPayload) return;
+
+    setSaving(true);
+    setError(null);
+
+    try {
+      await submitPayload({ ...pendingPayload, forceSave: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Fehler beim Speichern.");
     } finally {
@@ -210,7 +227,7 @@ export function CreateOrderForm({
           <div>
             <h2 className="g98-section-title">Schnellplaner</h2>
             <p className="g98-section-subtitle">
-              Auftrag anlegen, Vorschlag holen, speichern.
+              Startzeit manuell setzen, Konflikte prüfen, bei Bedarf trotzdem speichern.
             </p>
           </div>
 
@@ -246,7 +263,7 @@ export function CreateOrderForm({
                   {selectedUser?.name || "Keine Person"}
                 </div>
                 <div className="text-sm text-slate-500">
-                  Mitarbeiterfarbe = Orientierung
+                  Manuelle Planung, nur Warnung bei Konflikten
                 </div>
               </div>
             </div>
@@ -272,7 +289,7 @@ export function CreateOrderForm({
                   {selectedTask?.name || "Keine Arbeitsart"}
                 </div>
                 <div className="text-sm text-slate-500">
-                  Akzentfarbe = Kategorie
+                  Titel wird automatisch gesetzt, wenn leer
                 </div>
               </div>
             </div>
@@ -286,10 +303,52 @@ export function CreateOrderForm({
         </div>
       ) : null}
 
+      {warning ? (
+        <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm text-amber-900">
+          <div className="font-semibold">{warning}</div>
+
+          {conflicts.length > 0 ? (
+            <div className="mt-3 space-y-2">
+              {conflicts.map((conflict, index) => (
+                <div
+                  key={`${conflict.start}-${conflict.end}-${index}`}
+                  className="rounded-xl border border-amber-200 bg-white px-3 py-2"
+                >
+                  {formatConflictRange(conflict.start, conflict.end)}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={confirmSaveDespiteConflict}
+              disabled={saving}
+              className="g98-action-primary"
+            >
+              {saving ? "Speichert ..." : "Trotzdem speichern"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setWarning(null);
+                setConflicts([]);
+                setPendingPayload(null);
+              }}
+              className="g98-action-secondary"
+            >
+              Abbrechen
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <form onSubmit={onSubmit} className="space-y-5">
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium text-slate-700">Kund:in</label>
+            <label className="text-sm font-medium text-slate-700">Kund:in *</label>
             <input
               value={customerName}
               onChange={(e) => setCustomerName(e.target.value)}
@@ -315,8 +374,7 @@ export function CreateOrderForm({
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               className="w-full rounded-2xl border px-4 py-3 text-sm outline-none"
-              placeholder="Innenreinigung"
-              required
+              placeholder={selectedTask?.name || "wird aus Arbeitsart übernommen"}
             />
           </div>
 
@@ -331,15 +389,12 @@ export function CreateOrderForm({
           </div>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           <div className="space-y-2">
-            <label className="text-sm font-medium text-slate-700">Person</label>
+            <label className="text-sm font-medium text-slate-700">Person *</label>
             <select
               value={userId}
-              onChange={(e) => {
-                setUserId(e.target.value);
-                setSuggestion(null);
-              }}
+              onChange={(e) => setUserId(e.target.value)}
               className="w-full rounded-2xl border px-4 py-3 text-sm"
               required
             >
@@ -352,12 +407,10 @@ export function CreateOrderForm({
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium text-slate-700">Arbeitsart</label>
+            <label className="text-sm font-medium text-slate-700">Arbeitsart *</label>
             <select
               value={taskTypeId}
-              onChange={(e) => {
-                setTaskTypeId(e.target.value);
-              }}
+              onChange={(e) => setTaskTypeId(e.target.value)}
               className="w-full rounded-2xl border px-4 py-3 text-sm"
               required
             >
@@ -370,14 +423,22 @@ export function CreateOrderForm({
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium text-slate-700">Tag</label>
+            <label className="text-sm font-medium text-slate-700">Tag *</label>
             <input
               type="date"
               value={selectedDate}
-              onChange={(e) => {
-                setSelectedDate(e.target.value);
-                setSuggestion(null);
-              }}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="w-full rounded-2xl border px-4 py-3 text-sm"
+              required
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-slate-700">Startzeit *</label>
+            <input
+              type="time"
+              value={startTime}
+              onChange={(e) => setStartTime(e.target.value)}
               className="w-full rounded-2xl border px-4 py-3 text-sm"
               required
             />
@@ -406,10 +467,7 @@ export function CreateOrderForm({
                 <button
                   key={option.value}
                   type="button"
-                  onClick={() => {
-                    setDurationMinutes(option.value);
-                    setSuggestion(null);
-                  }}
+                  onClick={() => setDurationMinutes(option.value)}
                   className={`rounded-full border px-4 py-2 text-sm font-medium transition ${
                     active
                       ? "border-slate-900 bg-slate-900 text-white"
@@ -437,27 +495,19 @@ export function CreateOrderForm({
 
             <div className="rounded-[26px] border bg-slate-50 p-4 text-sm text-slate-600">
               <div className="mb-2 font-semibold text-slate-800">
-                Planungshinweis
+                Hinweis
               </div>
               <ul className="space-y-1">
-                <li>• Arbeitszeiten werden automatisch berücksichtigt.</li>
-                <li>• Lange Aufträge werden auf mehrere Tage aufgeteilt.</li>
-                <li>• Der Vorschlag orientiert sich an freien Slots.</li>
+                <li>• Es wird nichts automatisch verschoben.</li>
+                <li>• Startzeit wird manuell gesetzt.</li>
+                <li>• Konflikte werden nur als Warnung angezeigt.</li>
+                <li>• Längere Aufträge werden weiter nach Arbeitszeiten aufgeteilt.</li>
               </ul>
             </div>
           </div>
         ) : null}
 
         <div className="flex flex-col gap-2 sm:flex-row">
-          <button
-            type="button"
-            onClick={loadSuggestion}
-            disabled={loadingSuggestion}
-            className="g98-action-secondary"
-          >
-            {loadingSuggestion ? "Berechne Vorschlag ..." : "Vorschlag laden"}
-          </button>
-
           <button
             type="submit"
             disabled={saving}
@@ -466,46 +516,6 @@ export function CreateOrderForm({
             {saving ? "Speichert ..." : "Auftrag anlegen"}
           </button>
         </div>
-
-        {suggestion ? (
-          <div className="rounded-[28px] border border-sky-200 bg-sky-50 p-4">
-            <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="text-sm font-semibold text-sky-900">
-                  Planungsvorschlag
-                </div>
-                <div className="text-sm text-sky-700">
-                  {selectedUser?.name ?? "Ausgewählte Person"}
-                </div>
-              </div>
-
-              <div className="text-sm font-medium text-sky-800">
-                Start: {dayjs(suggestion.start).format("DD.MM.YYYY HH:mm")}
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              {suggestion.blocks.map((block, index) => (
-                <div
-                  key={`${block.start}-${index}`}
-                  className="rounded-2xl border border-sky-100 bg-white px-4 py-3"
-                >
-                  <div className="text-sm font-medium text-slate-900">
-                    {formatPreviewRange(block.start, block.end)}
-                  </div>
-                  <div className="text-xs text-slate-500">
-                    {Math.round((block.durationMinutes / 60) * 100) / 100} h
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <div className="rounded-[28px] border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
-            Mit <span className="font-medium">„Vorschlag laden“</span> siehst du
-            sofort, wann der Auftrag eingeplant wird.
-          </div>
-        )}
       </form>
     </section>
   );
