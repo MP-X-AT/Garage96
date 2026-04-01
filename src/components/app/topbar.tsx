@@ -13,11 +13,12 @@ type TopbarProps = {
 };
 
 const navItems = [
-  { href: "/", label: "Dashboard" },
+  { href: "/", label: "Start" },
   { href: "/tagesansicht", label: "Heute" },
   { href: "/wochenansicht", label: "Woche" },
   { href: "/monatsansicht", label: "Monat" },
   { href: "/jahresansicht", label: "Jahr" },
+  { href: "/dashboard", label: "Dashboard" },
 ];
 
 function isActive(pathname: string, href: string) {
@@ -34,7 +35,7 @@ export function Topbar({ title, subtitle, primaryAction }: TopbarProps) {
         <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0">
             <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.18em] text-sky-700">
-              Garage98 Kalender
+              Garage96 Kalender
             </div>
             <h1 className="font-heading truncate text-2xl font-semibold text-slate-900 md:text-3xl">
               {title}

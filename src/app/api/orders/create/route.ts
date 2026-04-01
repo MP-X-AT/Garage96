@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
     const customerName = String(body.customerName || "").trim();
     const phone = String(body.phone || "").trim();
     const email = String(body.email || "").trim();
-    const title = String(body.title || "").trim();
+    let title = String(body.title || "").trim();
     const vehicleInfo = String(body.vehicleInfo || "").trim();
     const licensePlate = String(body.licensePlate || "").trim();
     const notes = String(body.notes || "").trim();
@@ -46,13 +46,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!title) {
-      return NextResponse.json(
-        { success: false, error: "Titel ist erforderlich." },
-        { status: 400 }
-      );
-    }
-
     if (!userId || Number.isNaN(userId)) {
       return NextResponse.json(
         { success: false, error: "Mitarbeiter:in ist erforderlich." },
@@ -79,6 +72,20 @@ export async function POST(req: NextRequest) {
         { success: false, error: "Gültiges Datum ist erforderlich." },
         { status: 400 }
       );
+    }
+
+    if (!title && taskTypeId && !Number.isNaN(taskTypeId)) {
+      const [taskTypeRows] = await connection.query<(RowDataPacket & { name: string })[]>(
+        `
+          SELECT name
+          FROM task_types
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [taskTypeId]
+      );
+
+      title = taskTypeRows[0]?.name?.trim() || "Auftrag";
     }
 
     await connection.beginTransaction();
