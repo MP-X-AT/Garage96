@@ -97,10 +97,6 @@ export function BlockDetailsSheet({
   const [startHour, setStartHour] = useState("8");
   const [durationMinutes, setDurationMinutes] = useState(120);
 
-  const selectedUser = users.find((user) => String(user.id) === userId);
-  const selectedTaskType = taskTypes.find(
-    (taskType) => String(taskType.id) === taskTypeId
-  );
 
   const employeeTheme = getEmployeeTheme({
     userId: block?.user_id,

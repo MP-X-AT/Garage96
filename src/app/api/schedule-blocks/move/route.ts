@@ -2,9 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import dayjs from "@/lib/dayjs";
 import { db } from "@/lib/db";
 import {
-  WORKDAY_END_HOUR,
-  WORKDAY_START_HOUR,
   moveScheduleBlockWithRules,
+  getEffectiveWorkdayConfig,
 } from "@/lib/scheduling";
 
 export async function POST(request: NextRequest) {
@@ -15,47 +14,33 @@ export async function POST(request: NextRequest) {
 
     const blockId = Number(body.blockId);
     const userId = Number(body.userId);
+    const start = dayjs(body.start);
 
-    const start =
-      body.start && dayjs(body.start).isValid()
-        ? dayjs(body.start)
-        : body.date &&
-          body.hour !== undefined &&
-          body.hour !== null &&
-          !Number.isNaN(Number(body.hour))
-        ? dayjs(
-            `${body.date} ${String(Number(body.hour)).padStart(2, "0")}:00:00`
-          )
-        : null;
-
-    if (!blockId || Number.isNaN(blockId)) {
+    if (!blockId || !userId || !start.isValid()) {
       return NextResponse.json(
-        { success: false, error: "blockId ist erforderlich." },
+        { success: false, error: "Ungültige Eingabedaten." },
         { status: 400 }
       );
     }
 
-    if (!userId || Number.isNaN(userId)) {
+    // 🔥 zentrale Validierung über Scheduling-Core
+    const workday = await getEffectiveWorkdayConfig(connection, start);
+
+    if (!workday.isWorkingDay || !workday.workStart || !workday.workEnd) {
       return NextResponse.json(
-        { success: false, error: "userId ist erforderlich." },
+        { success: false, error: "An diesem Tag kann nicht gearbeitet werden." },
         { status: 400 }
       );
     }
 
-    if (!start || !start.isValid()) {
-      return NextResponse.json(
-        { success: false, error: "Gültige Zielzeit ist erforderlich." },
-        { status: 400 }
-      );
-    }
-
-    const hour = start.hour();
-
-    if (hour < WORKDAY_START_HOUR || hour >= WORKDAY_END_HOUR) {
+    if (
+      start.isBefore(workday.workStart) ||
+      !start.isBefore(workday.workEnd)
+    ) {
       return NextResponse.json(
         {
           success: false,
-          error: `Verschieben nur innerhalb der Arbeitszeit ${WORKDAY_START_HOUR}:00–${WORKDAY_END_HOUR}:00 möglich.`,
+          error: "Startzeit liegt außerhalb der Arbeitszeit.",
         },
         { status: 400 }
       );
@@ -78,11 +63,11 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     await connection.rollback();
 
-    const message =
-      error instanceof Error ? error.message : "Unbekannter Fehler";
-
     return NextResponse.json(
-      { success: false, error: message },
+      {
+        success: false,
+        error: error instanceof Error ? error.message : "Fehler",
+      },
       { status: 500 }
     );
   } finally {

@@ -3,9 +3,9 @@ import dayjs from "@/lib/dayjs";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { db } from "@/lib/db";
 import {
+  findNextAvailableSlot,
   getExistingBlocksForUserFromDate,
   overlaps,
-  splitIntoWorkingBlocks,
   syncOrderPlanningFields,
 } from "@/lib/scheduling";
 
@@ -42,7 +42,11 @@ function buildConflictPayload(
     }
   }
 
-  const unique = new Map<string, { start: string; end: string; orderId?: number }>();
+  const unique = new Map<
+    string,
+    { start: string; end: string; orderId?: number }
+  >();
+
   for (const item of conflicts) {
     unique.set(`${item.start}-${item.end}-${item.orderId ?? ""}`, item);
   }
@@ -122,7 +126,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!startRaw || !dayjs(startRaw).isValid()) {
+    if (startRaw && !dayjs(startRaw).isValid()) {
       return NextResponse.json(
         { success: false, error: "Gültige Startzeit ist erforderlich." },
         { status: 400 }
@@ -143,14 +147,30 @@ export async function POST(req: NextRequest) {
       title = taskTypeRows[0]?.name?.trim() || "Auftrag";
     }
 
-    const start = dayjs(startRaw).format("YYYY-MM-DD HH:mm:ss");
-    const plannedBlocks = await splitIntoWorkingBlocks(connection, start, durationMinutes);
-
-    const existing = (await getExistingBlocksForUserFromDate(
+    const suggestion = await findNextAvailableSlot({
       connection,
       userId,
-      dayjs(start).format("YYYY-MM-DD")
-    )) as ExistingBusyBlock[];
+      durationMinutes,
+      startDate: date,
+      requestedStart: startRaw
+        ? dayjs(startRaw).format("YYYY-MM-DD HH:mm:ss")
+        : undefined,
+    });
+
+    const plannedBlocks = suggestion.blocks.map((block) => ({
+      start: block.start,
+      end: block.end,
+    }));
+
+    if (!plannedBlocks.length) {
+      throw new Error("Es konnte kein gültiger Zeitblock geplant werden.");
+    }
+
+    const existing = await getExistingBlocksForUserFromDate(
+      connection,
+      userId,
+      dayjs(plannedBlocks[0].start).format("YYYY-MM-DD")
+    );
 
     const conflicts = buildConflictPayload(plannedBlocks, existing);
 
@@ -163,6 +183,9 @@ export async function POST(req: NextRequest) {
             "Für diese Person gibt es im gewählten Zeitraum bereits geplante Blöcke.",
           conflicts,
           plannedBlocks,
+          actualStart: suggestion.actualStart,
+          actualEnd: suggestion.actualEnd,
+          infoMessage: suggestion.adjustmentMessage,
         },
         { status: 409 }
       );
@@ -280,16 +303,9 @@ export async function POST(req: NextRequest) {
             status,
             source,
             notes
-          ) VALUES (?, ?, ?, ?, ?, 'geplant', 'manual', ?)
+          ) VALUES (?, ?, ?, ?, ?, 'geplant', 'auto', ?)
         `,
-        [
-          orderId,
-          userId,
-          taskTypeId,
-          block.start,
-          block.end,
-          notes || null,
-        ]
+        [orderId, userId, taskTypeId, block.start, block.end, notes || null]
       );
     }
 
@@ -300,6 +316,9 @@ export async function POST(req: NextRequest) {
       success: true,
       orderId,
       blocks: plannedBlocks,
+      plannedStart,
+      plannedEnd,
+      infoMessage: suggestion.adjustmentMessage,
       warning:
         conflicts.length > 0
           ? "Es gab Planungskonflikte, der Auftrag wurde aber bewusst gespeichert."
@@ -308,7 +327,9 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     try {
       await connection.rollback();
-    } catch {}
+    } catch {
+      // ignore rollback error
+    }
 
     const message =
       error instanceof Error ? error.message : "Unbekannter Fehler";

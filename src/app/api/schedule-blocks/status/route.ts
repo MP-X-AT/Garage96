@@ -2,16 +2,27 @@ import { NextRequest, NextResponse } from "next/server";
 import { ResultSetHeader } from "mysql2";
 import { db } from "@/lib/db";
 
-const allowedStatuses = ["geplant", "in_arbeit", "pausiert", "erledigt"] as const;
+const allowedStatuses = [
+  "geplant",
+  "in_arbeit",
+  "pausiert",
+  "erledigt",
+] as const;
+
+type AllowedStatus = (typeof allowedStatuses)[number];
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body = (await request.json()) as Record<string, unknown>;
 
     const scheduleBlockId = Number(body.scheduleBlockId);
-    const status = String(body.status ?? "");
+    const status = String(body.status ?? "") as AllowedStatus;
 
-    if (!scheduleBlockId || !allowedStatuses.includes(status as (typeof allowedStatuses)[number])) {
+    if (
+      !scheduleBlockId ||
+      Number.isNaN(scheduleBlockId) ||
+      !allowedStatuses.includes(status)
+    ) {
       return NextResponse.json(
         { success: false, error: "Ungültige Eingabedaten." },
         { status: 400 }
@@ -35,12 +46,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    return NextResponse.json({ success: true });
+    return NextResponse.json({
+      success: true,
+      status,
+    });
   } catch (error) {
     return NextResponse.json(
       {
         success: false,
-        error: error instanceof Error ? error.message : "Unbekannter Fehler",
+        error:
+          error instanceof Error ? error.message : "Unbekannter Fehler",
       },
       { status: 500 }
     );

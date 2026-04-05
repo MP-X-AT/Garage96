@@ -15,6 +15,7 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
+
 import { formatHours, getEmployeeTheme, getTaskTheme } from "@/lib/ui-theme";
 import type { CalendarBlock } from "@/types/calendar";
 import type { CalendarException } from "@/lib/calendar";
@@ -40,10 +41,12 @@ type MonthSummary = {
   urgentCount: number;
   blockedDays: number;
   infoDays: number;
+  activeUsers: number;
   userLoad: {
     userId: number;
     userName: string;
     totalMinutes: number;
+    count: number;
   }[];
 };
 
@@ -62,6 +65,27 @@ const MONTH_LABELS = [
   "Dezember",
 ];
 
+function overlapsMonth(block: CalendarBlock, monthDate: dayjs.Dayjs) {
+  const monthStart = monthDate.startOf("month");
+  const monthEnd = monthDate.endOf("month").add(1, "day").startOf("day");
+  const blockStart = dayjs(block.block_start);
+  const blockEnd = dayjs(block.block_end);
+
+  return blockStart.isBefore(monthEnd) && blockEnd.isAfter(monthStart);
+}
+
+function getExceptionCounts(monthExceptions: CalendarException[]) {
+  const blockedDays = monthExceptions.filter(
+    (item) => !(item.display_only === 1 || item.exception_type === "info")
+  ).length;
+
+  const infoDays = monthExceptions.filter(
+    (item) => item.display_only === 1 || item.exception_type === "info"
+  ).length;
+
+  return { blockedDays, infoDays };
+}
+
 function buildYearSummary(
   year: number,
   users: UserColumn[],
@@ -72,9 +96,15 @@ function buildYearSummary(
     const date = dayjs(`${year}-${String(index + 1).padStart(2, "0")}-01`);
     const key = date.format("YYYY-MM");
 
-    const monthBlocks = blocks.filter(
-      (block) => dayjs(block.block_start).format("YYYY-MM") === key
-    );
+    const monthBlocks = blocks
+      .filter((block) => overlapsMonth(block, date))
+      .sort((a, b) => {
+        const aStart = dayjs(a.block_start).valueOf();
+        const bStart = dayjs(b.block_start).valueOf();
+
+        if (aStart !== bStart) return aStart - bStart;
+        return a.schedule_block_id - b.schedule_block_id;
+      });
 
     const monthExceptions = exceptions.filter(
       (item) => dayjs(item.exception_date).format("YYYY-MM") === key
@@ -89,23 +119,22 @@ function buildYearSummary(
       (block) => block.priority === "hoch" || block.priority === "dringend"
     ).length;
 
-    const blockedDays = monthExceptions.filter(
-      (item) => !(item.display_only === 1 || item.exception_type === "info")
-    ).length;
+    const { blockedDays, infoDays } = getExceptionCounts(monthExceptions);
 
-    const infoDays = monthExceptions.filter(
-      (item) => item.display_only === 1 || item.exception_type === "info"
-    ).length;
+    const activeUsers = new Set(monthBlocks.map((block) => block.user_id)).size;
 
     const userLoad = users.map((user) => {
-      const totalMinutesPerUser = monthBlocks
-        .filter((block) => block.user_id === user.id)
-        .reduce((sum, block) => sum + block.block_duration_minutes, 0);
+      const userBlocks = monthBlocks.filter((block) => block.user_id === user.id);
+      const totalMinutesPerUser = userBlocks.reduce(
+        (sum, block) => sum + block.block_duration_minutes,
+        0
+      );
 
       return {
         userId: user.id,
         userName: user.name,
         totalMinutes: totalMinutesPerUser,
+        count: userBlocks.length,
       };
     });
 
@@ -118,6 +147,7 @@ function buildYearSummary(
       urgentCount,
       blockedDays,
       infoDays,
+      activeUsers,
       userLoad,
     };
   });
@@ -132,15 +162,36 @@ function getLoadBarClass(totalMinutes: number) {
 }
 
 function getRelativeLoadWidth(totalMinutes: number, maxMinutes: number) {
-  if (maxMinutes <= 0) return 0;
-  return Math.max(6, Math.round((totalMinutes / maxMinutes) * 100));
+  if (maxMinutes <= 0 || totalMinutes <= 0) return 0;
+  return Math.max(8, Math.round((totalMinutes / maxMinutes) * 100));
+}
+
+function getMonthAccentClass(month: MonthSummary) {
+  if (month.blockedDays > 0) return "ring-1 ring-red-100";
+  if (month.infoDays > 0) return "ring-1 ring-sky-100";
+  return "";
+}
+
+function buildTargetStartForMonth(block: CalendarBlock, monthKey: string) {
+  const originalStart = dayjs(block.block_start);
+  const targetMonthStart = dayjs(`${monthKey}-01`);
+  const targetDay = Math.min(originalStart.date(), targetMonthStart.daysInMonth());
+
+  return targetMonthStart
+    .date(targetDay)
+    .hour(originalStart.hour())
+    .minute(originalStart.minute())
+    .second(originalStart.second())
+    .millisecond(0)
+    .format("YYYY-MM-DD HH:mm:ss");
 }
 
 function DraggableYearBlock({ block }: { block: CalendarBlock }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
-    id: `year-block-${block.schedule_block_id}`,
-    data: { block },
-  });
+  const { attributes, listeners, setNodeRef, transform, isDragging } =
+    useDraggable({
+      id: `year-block-${block.schedule_block_id}`,
+      data: { block },
+    });
 
   const employeeTheme = getEmployeeTheme({
     userId: block.user_id,
@@ -166,11 +217,24 @@ function DraggableYearBlock({ block }: { block: CalendarBlock }) {
       }`}
       style={{ ...(style || {}), borderColor: employeeTheme.border }}
     >
-      <div className="truncate text-xs font-semibold text-slate-900">{block.title}</div>
-      <div className="truncate text-[11px] text-slate-500">{block.customer_name}</div>
+      <div className="mb-1 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate text-xs font-semibold text-slate-900">
+            {block.title}
+          </div>
+          <div className="truncate text-[11px] text-slate-500">
+            {block.customer_name}
+          </div>
+        </div>
+
+        <div className="shrink-0 text-[11px] font-medium text-slate-400">
+          {dayjs(block.block_start).format("DD.MM.")}
+        </div>
+      </div>
+
       <div className="mt-1 flex items-center gap-2 text-[11px]">
         <span
-          className="inline-block h-2 w-2 rounded-full"
+          className="inline-block h-2 w-2 shrink-0 rounded-full"
           style={{ backgroundColor: employeeTheme.solid }}
         />
         <span className="truncate text-slate-500">{block.user_name}</span>
@@ -185,7 +249,7 @@ function DraggableYearBlock({ block }: { block: CalendarBlock }) {
 
 function YearDragOverlay({ block }: { block: CalendarBlock }) {
   return (
-    <div className="w-[260px]">
+    <div className="w-[280px]">
       <DraggableYearBlock block={block} />
     </div>
   );
@@ -208,13 +272,7 @@ function MonthDropZone({
       ref={setNodeRef}
       className={`rounded-[28px] border bg-white p-5 shadow-sm transition ${
         isOver ? "ring-2 ring-sky-300 shadow-md" : "hover:shadow-md"
-      } ${
-        month.blockedDays > 0
-          ? "ring-1 ring-red-100"
-          : month.infoDays > 0
-            ? "ring-1 ring-sky-100"
-            : ""
-      }`}
+      } ${getMonthAccentClass(month)}`}
     >
       {children}
     </div>
@@ -241,12 +299,35 @@ export function YearViewClient({
     [year, users, blocks, exceptions]
   );
 
-  const totalMinutes = months.reduce((sum, month) => sum + month.totalMinutes, 0);
-  const totalBlocks = months.reduce((sum, month) => sum + month.blocks.length, 0);
-  const totalUrgent = months.reduce((sum, month) => sum + month.urgentCount, 0);
-  const totalBlockedDays = months.reduce((sum, month) => sum + month.blockedDays, 0);
-  const totalInfoDays = months.reduce((sum, month) => sum + month.infoDays, 0);
-  const maxMinutes = Math.max(...months.map((month) => month.totalMinutes), 0);
+  const totalMinutes = useMemo(
+    () => months.reduce((sum, month) => sum + month.totalMinutes, 0),
+    [months]
+  );
+
+  const totalBlocks = useMemo(
+    () => months.reduce((sum, month) => sum + month.blocks.length, 0),
+    [months]
+  );
+
+  const totalUrgent = useMemo(
+    () => months.reduce((sum, month) => sum + month.urgentCount, 0),
+    [months]
+  );
+
+  const totalBlockedDays = useMemo(
+    () => months.reduce((sum, month) => sum + month.blockedDays, 0),
+    [months]
+  );
+
+  const totalInfoDays = useMemo(
+    () => months.reduce((sum, month) => sum + month.infoDays, 0),
+    [months]
+  );
+
+  const maxMinutes = useMemo(
+    () => Math.max(...months.map((month) => month.totalMinutes), 0),
+    [months]
+  );
 
   function handleDragStart(event: DragStartEvent) {
     const block = event.active.data.current?.block as CalendarBlock | undefined;
@@ -268,13 +349,15 @@ export function YearViewClient({
       setSaving(true);
       setError(null);
 
-      const response = await fetch("/api/schedule-blocks/move-to-month", {
+      const newStart = buildTargetStartForMonth(block, monthKey);
+
+      const response = await fetch("/api/schedule-blocks/move", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           blockId: block.schedule_block_id,
           userId: block.user_id,
-          targetMonth: `${monthKey}-01`,
+          start: newStart,
         }),
       });
 
@@ -305,24 +388,48 @@ export function YearViewClient({
 
           <div className="grid grid-cols-5 gap-2">
             <div className="rounded-2xl border bg-white px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Blöcke</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{totalBlocks}</div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">
+                Blöcke
+              </div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalBlocks}
+              </div>
             </div>
+
             <div className="rounded-2xl border bg-white px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Stunden</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{formatHours(totalMinutes)}</div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">
+                Stunden
+              </div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {formatHours(totalMinutes)}
+              </div>
             </div>
+
             <div className="rounded-2xl border bg-white px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Wichtig</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{totalUrgent}</div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">
+                Wichtig
+              </div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalUrgent}
+              </div>
             </div>
+
             <div className="rounded-2xl border bg-white px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Feiertage</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{totalBlockedDays}</div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">
+                Feiertage
+              </div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalBlockedDays}
+              </div>
             </div>
+
             <div className="rounded-2xl border bg-white px-4 py-3">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Info</div>
-              <div className="mt-1 text-lg font-semibold text-slate-900">{totalInfoDays}</div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-500">
+                Info
+              </div>
+              <div className="mt-1 text-lg font-semibold text-slate-900">
+                {totalInfoDays}
+              </div>
             </div>
           </div>
         </div>
@@ -335,7 +442,7 @@ export function YearViewClient({
 
         {saving ? (
           <div className="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-700">
-            Block wird in den Zielmonat eingeplant …
+            Block wird in den Zielmonat verschoben …
           </div>
         ) : null}
       </section>
@@ -345,7 +452,7 @@ export function YearViewClient({
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        <section className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+        <section className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
           {months.map((month, index) => (
             <MonthDropZone key={month.key} month={month}>
               <div className="mb-4 flex items-start justify-between gap-3">
@@ -358,6 +465,9 @@ export function YearViewClient({
                   </Link>
                   <div className="text-sm text-slate-500">
                     {month.blocks.length} Block{month.blocks.length === 1 ? "" : "e"}
+                  </div>
+                  <div className="text-[11px] text-slate-400">
+                    {month.activeUsers} aktive Mitarbeitende
                   </div>
                 </div>
 
@@ -394,7 +504,10 @@ export function YearViewClient({
                   <div
                     className={`h-2.5 rounded-full ${getLoadBarClass(month.totalMinutes)}`}
                     style={{
-                      width: `${getRelativeLoadWidth(month.totalMinutes, maxMinutes)}%`,
+                      width:
+                        month.totalMinutes > 0
+                          ? `${getRelativeLoadWidth(month.totalMinutes, maxMinutes)}%`
+                          : "0%",
                     }}
                   />
                 </div>
@@ -423,9 +536,11 @@ export function YearViewClient({
                         </span>
                       </div>
 
-                      <span className="shrink-0 text-xs font-medium text-slate-500">
-                        {formatHours(item.totalMinutes)}
-                      </span>
+                      <div className="flex shrink-0 items-center gap-2 text-xs font-medium text-slate-500">
+                        <span>{item.count} Block{item.count === 1 ? "" : "e"}</span>
+                        <span className="text-slate-300">•</span>
+                        <span>{formatHours(item.totalMinutes)}</span>
+                      </div>
                     </div>
                   );
                 })}
@@ -438,11 +553,13 @@ export function YearViewClient({
                     block={block}
                   />
                 ))}
+
                 {month.blocks.length > 3 ? (
                   <div className="text-[11px] font-medium text-slate-400">
                     +{month.blocks.length - 3} weitere
                   </div>
                 ) : null}
+
                 {month.blocks.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-3 py-4 text-center text-xs text-slate-400">
                     Block hierher ziehen

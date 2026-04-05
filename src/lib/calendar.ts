@@ -1,7 +1,8 @@
 import dayjs from "@/lib/dayjs";
-import type { ResultSetHeader, RowDataPacket } from "mysql2";
+import type { RowDataPacket } from "mysql2";
 import { db } from "@/lib/db";
 import type { CalendarBlock } from "@/types/calendar";
+import { moveScheduleBlockWithRules } from "@/lib/scheduling";
 
 export type TaskTypeOption = {
   id: number;
@@ -38,17 +39,13 @@ type CalendarExceptionRow = RowDataPacket & {
   notes: string | null;
 };
 
-type ScheduleBlockRow = RowDataPacket & {
-  id: number;
-  block_start: string | Date;
-  block_end: string | Date;
-};
 
 const DEFAULT_USERS: UserOption[] = [
   { id: 1, name: "Michi" },
   { id: 2, name: "Sandra" },
   { id: 3, name: "Erwin" },
 ];
+
 
 function normalizeDate(date: string) {
   const parsed = dayjs(date);
@@ -74,44 +71,40 @@ function mapCalendarException(row: CalendarExceptionRow): CalendarException {
   };
 }
 
-export async function getDayCalendarBlocks(date: string): Promise<CalendarBlock[]> {
-  const day = normalizeDate(date);
-  const start = day.startOf("day").format("YYYY-MM-DD HH:mm:ss");
-  const end = day.add(1, "day").startOf("day").format("YYYY-MM-DD HH:mm:ss");
-
+async function getCalendarBlocksForRange(
+  rangeStart: string,
+  rangeEndExclusive: string
+): Promise<CalendarBlock[]> {
   const [rows] = await db.query(
     `
       SELECT *
       FROM v_calendar_blocks
-      WHERE block_start >= ?
-        AND block_start < ?
-      ORDER BY user_name, block_start
+      WHERE block_start < ?
+        AND block_end > ?
+      ORDER BY block_start ASC, user_name ASC
     `,
-    [start, end]
+    [rangeEndExclusive, rangeStart]
   );
 
   return rows as CalendarBlock[];
 }
 
+export async function getDayCalendarBlocks(date: string): Promise<CalendarBlock[]> {
+  const day = normalizeDate(date).startOf("day");
+  const start = day.format("YYYY-MM-DD HH:mm:ss");
+  const end = day.add(1, "day").format("YYYY-MM-DD HH:mm:ss");
+
+  return getCalendarBlocksForRange(start, end);
+}
+
 export async function getWeekCalendarBlocks(weekStart: string): Promise<CalendarBlock[]> {
   const startDate = normalizeDate(weekStart).startOf("day");
-  const endDate = startDate.add(6, "day").endOf("day");
+  const endDateExclusive = startDate.add(7, "day").startOf("day");
 
-  const [rows] = await db.query(
-    `
-      SELECT *
-      FROM v_calendar_blocks
-      WHERE block_start >= ?
-        AND block_start <= ?
-      ORDER BY block_start ASC, user_name ASC
-    `,
-    [
-      startDate.format("YYYY-MM-DD HH:mm:ss"),
-      endDate.format("YYYY-MM-DD HH:mm:ss"),
-    ]
+  return getCalendarBlocksForRange(
+    startDate.format("YYYY-MM-DD HH:mm:ss"),
+    endDateExclusive.format("YYYY-MM-DD HH:mm:ss")
   );
-
-  return rows as CalendarBlock[];
 }
 
 export async function getUsersForDay(date: string): Promise<UserOption[]> {
@@ -172,77 +165,17 @@ export async function moveScheduleBlock(params: {
   userId: number;
   newStart: string;
 }) {
-  const [rows] = await db.query<ScheduleBlockRow[]>(
-    `
-      SELECT id, block_start, block_end
-      FROM schedule_blocks
-      WHERE id = ?
-      LIMIT 1
-    `,
-    [params.scheduleBlockId]
-  );
+  const connection = await db.getConnection();
 
-  if (rows.length === 0) {
-    throw new Error("Kalenderblock nicht gefunden.");
+  try {
+    return await moveScheduleBlockWithRules(connection, {
+      blockId: params.scheduleBlockId,
+      userId: params.userId,
+      newStart: params.newStart,
+    });
+  } finally {
+    connection.release();
   }
-
-  const block = rows[0];
-  const oldStart = dayjs(block.block_start);
-  const oldEnd = dayjs(block.block_end);
-  const durationMinutes = oldEnd.diff(oldStart, "minute");
-
-  if (durationMinutes <= 0) {
-    throw new Error("Ungültige Blockdauer.");
-  }
-
-  const newStart = dayjs(params.newStart);
-
-  if (!newStart.isValid()) {
-    throw new Error("Ungültiger neuer Startzeitpunkt.");
-  }
-
-  const newEnd = newStart.add(durationMinutes, "minute");
-
-  const [conflicts] = await db.query<RowDataPacket[]>(
-    `
-      SELECT id
-      FROM schedule_blocks
-      WHERE user_id = ?
-        AND id <> ?
-        AND block_start < ?
-        AND block_end > ?
-      LIMIT 1
-    `,
-    [
-      params.userId,
-      params.scheduleBlockId,
-      newEnd.format("YYYY-MM-DD HH:mm:ss"),
-      newStart.format("YYYY-MM-DD HH:mm:ss"),
-    ]
-  );
-
-  if (conflicts.length > 0) {
-    throw new Error("Konflikt: Diese Person ist in diesem Zeitraum bereits eingeplant.");
-  }
-
-  const [result] = await db.query<ResultSetHeader>(
-    `
-      UPDATE schedule_blocks
-      SET user_id = ?,
-          block_start = ?,
-          block_end = ?,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `,
-    [
-      params.userId,
-      newStart.format("YYYY-MM-DD HH:mm:ss"),
-      newEnd.format("YYYY-MM-DD HH:mm:ss"),
-      params.scheduleBlockId,
-    ]
-  );
-
-  return result.affectedRows === 1;
 }
 
 export async function getCalendarExceptions(
@@ -312,31 +245,22 @@ export async function getCalendarExceptionsForYear(
     throw new Error("Ungültiges Jahr.");
   }
 
-  return getCalendarExceptions(
-    `${year}-01-01`,
-    `${year}-12-31`
-  );
+  return getCalendarExceptions(`${year}-01-01`, `${year}-12-31`);
 }
 
 export async function getMonthCalendarBlocks(month: string): Promise<CalendarBlock[]> {
   const start = normalizeDate(month).startOf("month").startOf("week").add(1, "day");
-  const end = normalizeDate(month).endOf("month").endOf("week").subtract(1, "day");
+  const endExclusive = normalizeDate(month)
+    .endOf("month")
+    .endOf("week")
+    .subtract(1, "day")
+    .add(1, "day")
+    .startOf("day");
 
-  const [rows] = await db.query(
-    `
-      SELECT *
-      FROM v_calendar_blocks
-      WHERE block_start >= ?
-        AND block_start < ?
-      ORDER BY block_start ASC, user_name ASC
-    `,
-    [
-      start.startOf("day").format("YYYY-MM-DD HH:mm:ss"),
-      end.add(1, "day").startOf("day").format("YYYY-MM-DD HH:mm:ss"),
-    ]
+  return getCalendarBlocksForRange(
+    start.startOf("day").format("YYYY-MM-DD HH:mm:ss"),
+    endExclusive.format("YYYY-MM-DD HH:mm:ss")
   );
-
-  return rows as CalendarBlock[];
 }
 
 export async function getYearCalendarBlocks(year: number): Promise<CalendarBlock[]> {
@@ -345,21 +269,10 @@ export async function getYearCalendarBlocks(year: number): Promise<CalendarBlock
   }
 
   const start = dayjs(`${year}-01-01`).startOf("day");
-  const end = dayjs(`${year}-12-31`).endOf("day");
+  const endExclusive = dayjs(`${year + 1}-01-01`).startOf("day");
 
-  const [rows] = await db.query(
-    `
-      SELECT *
-      FROM v_calendar_blocks
-      WHERE block_start >= ?
-        AND block_start <= ?
-      ORDER BY block_start ASC, user_name ASC
-    `,
-    [
-      start.format("YYYY-MM-DD HH:mm:ss"),
-      end.format("YYYY-MM-DD HH:mm:ss"),
-    ]
+  return getCalendarBlocksForRange(
+    start.format("YYYY-MM-DD HH:mm:ss"),
+    endExclusive.format("YYYY-MM-DD HH:mm:ss")
   );
-
-  return rows as CalendarBlock[];
 }

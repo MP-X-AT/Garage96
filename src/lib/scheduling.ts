@@ -1,12 +1,7 @@
-import dayjs, { Dayjs } from "dayjs";
-import type { PoolConnection, RowDataPacket } from "mysql2/promise";
-
-export const WORK_START_HOUR = 8;
-export const WORK_END_HOUR = 17;
-export const WORKDAY_MINUTES = (WORK_END_HOUR - WORK_START_HOUR) * 60;
-
-export const WORKDAY_START_HOUR = WORK_START_HOUR;
-export const WORKDAY_END_HOUR = WORK_END_HOUR;
+import dayjs from "@/lib/dayjs";
+import type { Dayjs } from "dayjs";
+import type { PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import type { CalendarBlock } from "@/types/calendar";
 
 export type PlannedBlock = {
   start: string;
@@ -45,6 +40,18 @@ type CalendarExceptionRow = RowDataPacket & {
   notes: string | null;
 };
 
+export type ExistingBusyBlock = {
+  id: number;
+  orderId: number;
+  userId: number;
+  taskTypeId: number | null;
+  start: Dayjs;
+  end: Dayjs;
+  status: "geplant" | "in_arbeit" | "pausiert" | "erledigt";
+  source: "manual" | "auto";
+  notes: string | null;
+};
+
 export type EffectiveWorkdayConfig = {
   date: string;
   isWorkingDay: boolean;
@@ -55,8 +62,31 @@ export type EffectiveWorkdayConfig = {
   exceptionName?: string;
 };
 
-export function weekdayToDbWeekday(date: Dayjs): number {
-  return date.day() === 0 ? 7 : date.day();
+export type SlotSearchResult = {
+  requestedStart: string;
+  normalizedRequestedStart: string;
+  actualStart: string;
+  actualEnd: string;
+  blocks: PlannedBlock[];
+  adjusted: boolean;
+  adjustmentReason:
+    | "same_day_shifted"
+    | "closed_day"
+    | "holiday"
+    | "after_hours"
+    | "conflict"
+    | "grid_aligned"
+    | null;
+  adjustmentMessage: string | null;
+};
+
+const DEFAULT_WORK_START = "08:00:00";
+const DEFAULT_GRID_MINUTES = 15;
+const MAX_SEARCH_DAYS = 366;
+
+function weekdayToDbWeekday(date: Dayjs): number {
+  const weekday = date.day();
+  return weekday === 0 ? 7 : weekday;
 }
 
 function setTimeFromString(date: Dayjs, time: string): Dayjs {
@@ -69,7 +99,29 @@ function setTimeFromString(date: Dayjs, time: string): Dayjs {
     .millisecond(0);
 }
 
-export async function getWorkingHoursMap(connection: PoolConnection) {
+export function snapToTimeGrid(
+  value: Dayjs,
+  gridMinutes = DEFAULT_GRID_MINUTES,
+  mode: "floor" | "ceil" | "nearest" = "nearest"
+): Dayjs {
+  const normalized = value.second(0).millisecond(0);
+  const minutesOfDay = normalized.hour() * 60 + normalized.minute();
+
+  let snappedMinutes: number;
+
+  if (mode === "floor") {
+    snappedMinutes = Math.floor(minutesOfDay / gridMinutes) * gridMinutes;
+  } else if (mode === "ceil") {
+    snappedMinutes = Math.ceil(minutesOfDay / gridMinutes) * gridMinutes;
+  } else {
+    snappedMinutes = Math.round(minutesOfDay / gridMinutes) * gridMinutes;
+  }
+
+  const dayStart = normalized.startOf("day");
+  return dayStart.add(snappedMinutes, "minute");
+}
+
+async function getWorkingHoursMap(connection: PoolConnection) {
   const [rows] = await connection.query<WorkingHoursRow[]>(
     `
       SELECT weekday, start_time, end_time, is_working_day
@@ -94,10 +146,10 @@ export async function getWorkingHoursMap(connection: PoolConnection) {
   return map;
 }
 
-export async function getCalendarExceptionForDate(
+async function getCalendarExceptionForDate(
   connection: PoolConnection,
   date: Dayjs
-) {
+): Promise<CalendarExceptionRow | null> {
   const [rows] = await connection.query<CalendarExceptionRow[]>(
     `
       SELECT
@@ -128,13 +180,12 @@ export async function getEffectiveWorkdayConfig(
   const exception = await getCalendarExceptionForDate(connection, normalizedDate);
 
   if (exception) {
-    // INFO-Tage sperren nie die Planung
     if (exception.exception_type === "info" || exception.display_only === 1) {
       const map = await getWorkingHoursMap(connection);
       const weekday = weekdayToDbWeekday(normalizedDate);
-      const config = map.get(weekday);
+      const base = map.get(weekday);
 
-      if (!config || !config.isWorkingDay || !config.startTime || !config.endTime) {
+      if (!base || !base.isWorkingDay || !base.startTime || !base.endTime) {
         return {
           date: normalizedDate.format("YYYY-MM-DD"),
           isWorkingDay: false,
@@ -147,15 +198,13 @@ export async function getEffectiveWorkdayConfig(
       return {
         date: normalizedDate.format("YYYY-MM-DD"),
         isWorkingDay: true,
-        workStart: setTimeFromString(normalizedDate, config.startTime),
-        workEnd: setTimeFromString(normalizedDate, config.endTime),
+        workStart: setTimeFromString(normalizedDate, base.startTime),
+        workEnd: setTimeFromString(normalizedDate, base.endTime),
         source: "default",
       };
     }
 
-    const isWorkingDay = !!exception.is_working_day;
-
-    if (!isWorkingDay) {
+    if (!exception.is_working_day) {
       return {
         date: normalizedDate.format("YYYY-MM-DD"),
         isWorkingDay: false,
@@ -188,9 +237,9 @@ export async function getEffectiveWorkdayConfig(
 
   const map = await getWorkingHoursMap(connection);
   const weekday = weekdayToDbWeekday(normalizedDate);
-  const config = map.get(weekday);
+  const base = map.get(weekday);
 
-  if (!config || !config.isWorkingDay || !config.startTime || !config.endTime) {
+  if (!base || !base.isWorkingDay || !base.startTime || !base.endTime) {
     return {
       date: normalizedDate.format("YYYY-MM-DD"),
       isWorkingDay: false,
@@ -203,55 +252,59 @@ export async function getEffectiveWorkdayConfig(
   return {
     date: normalizedDate.format("YYYY-MM-DD"),
     isWorkingDay: true,
-    workStart: setTimeFromString(normalizedDate, config.startTime),
-    workEnd: setTimeFromString(normalizedDate, config.endTime),
+    workStart: setTimeFromString(normalizedDate, base.startTime),
+    workEnd: setTimeFromString(normalizedDate, base.endTime),
     source: "default",
   };
 }
 
 export async function normalizeToWorkingTime(
   connection: PoolConnection,
-  input: Dayjs
+  input: Dayjs,
+  gridMinutes = DEFAULT_GRID_MINUTES
 ): Promise<Dayjs> {
-  let current = input.second(0).millisecond(0);
+  let cursor = snapToTimeGrid(input, gridMinutes, "ceil");
 
-  for (let i = 0; i < 366; i++) {
-    const config = await getEffectiveWorkdayConfig(connection, current);
+  for (let i = 0; i < MAX_SEARCH_DAYS; i++) {
+    const config = await getEffectiveWorkdayConfig(connection, cursor);
 
     if (!config.isWorkingDay || !config.workStart || !config.workEnd) {
-      current = current.add(1, "day").hour(WORK_START_HOUR).minute(0).second(0).millisecond(0);
+      cursor = cursor.add(1, "day").hour(8).minute(0).second(0).millisecond(0);
+      cursor = snapToTimeGrid(cursor, gridMinutes, "ceil");
       continue;
     }
 
-    if (current.isBefore(config.workStart)) {
-      return config.workStart;
+    if (cursor.isBefore(config.workStart)) {
+      return snapToTimeGrid(config.workStart, gridMinutes, "ceil");
     }
 
-    if (!current.isBefore(config.workEnd)) {
-      current = current.add(1, "day").hour(WORK_START_HOUR).minute(0).second(0).millisecond(0);
+    if (!cursor.isBefore(config.workEnd)) {
+      cursor = cursor.add(1, "day").hour(8).minute(0).second(0).millisecond(0);
+      cursor = snapToTimeGrid(cursor, gridMinutes, "ceil");
       continue;
     }
 
-    return current;
+    return snapToTimeGrid(cursor, gridMinutes, "ceil");
   }
 
   throw new Error("Konnte keinen gültigen Arbeitszeitpunkt finden.");
 }
 
-export async function nextWorkingDayStart(
+async function nextWorkingDayStart(
   connection: PoolConnection,
-  date: Dayjs
+  input: Dayjs,
+  gridMinutes = DEFAULT_GRID_MINUTES
 ): Promise<Dayjs> {
-  let current = date.add(1, "day").hour(WORK_START_HOUR).minute(0).second(0).millisecond(0);
+  let cursor = input.add(1, "day").hour(8).minute(0).second(0).millisecond(0);
 
-  for (let i = 0; i < 366; i++) {
-    const config = await getEffectiveWorkdayConfig(connection, current);
+  for (let i = 0; i < MAX_SEARCH_DAYS; i++) {
+    const config = await getEffectiveWorkdayConfig(connection, cursor);
 
     if (config.isWorkingDay && config.workStart) {
-      return config.workStart;
+      return snapToTimeGrid(config.workStart, gridMinutes, "ceil");
     }
 
-    current = current.add(1, "day").hour(WORK_START_HOUR).minute(0).second(0).millisecond(0);
+    cursor = cursor.add(1, "day").hour(8).minute(0).second(0).millisecond(0);
   }
 
   throw new Error("Konnte keinen nächsten Arbeitstag finden.");
@@ -260,58 +313,57 @@ export async function nextWorkingDayStart(
 export async function splitIntoWorkingBlocks(
   connection: PoolConnection,
   startInput: string | Dayjs,
-  durationMinutes: number
+  durationMinutes: number,
+  gridMinutes = DEFAULT_GRID_MINUTES
 ): Promise<PlannedBlock[]> {
   if (!durationMinutes || durationMinutes <= 0) {
-    throw new Error("durationMinutes must be > 0");
+    throw new Error("Gültige Dauer ist erforderlich.");
   }
 
-  let current =
-    typeof startInput === "string"
-      ? await normalizeToWorkingTime(connection, dayjs(startInput))
-      : await normalizeToWorkingTime(connection, startInput);
+  let cursor = typeof startInput === "string" ? dayjs(startInput) : startInput;
 
-  if (!current.isValid()) {
+  if (!cursor.isValid()) {
     throw new Error("Ungültiger Startzeitpunkt.");
   }
 
-  let remaining = durationMinutes;
-  const blocks: PlannedBlock[] = [];
+  cursor = await normalizeToWorkingTime(connection, cursor, gridMinutes);
 
-  for (let i = 0; i < 366 && remaining > 0; i++) {
-    const config = await getEffectiveWorkdayConfig(connection, current);
+  const blocks: PlannedBlock[] = [];
+  let remaining = durationMinutes;
+
+  for (let i = 0; i < MAX_SEARCH_DAYS && remaining > 0; i++) {
+    const config = await getEffectiveWorkdayConfig(connection, cursor);
 
     if (!config.isWorkingDay || !config.workStart || !config.workEnd) {
-      current = await nextWorkingDayStart(connection, current);
+      cursor = await nextWorkingDayStart(connection, cursor, gridMinutes);
       continue;
     }
 
-    if (!current.isBefore(config.workEnd)) {
-      current = await nextWorkingDayStart(connection, current);
+    if (!cursor.isBefore(config.workEnd)) {
+      cursor = await nextWorkingDayStart(connection, cursor, gridMinutes);
       continue;
     }
 
-    const minutesLeftToday = config.workEnd.diff(current, "minute");
+    const usableMinutes = config.workEnd.diff(cursor, "minute");
 
-    if (minutesLeftToday <= 0) {
-      current = await nextWorkingDayStart(connection, current);
+    if (usableMinutes <= 0) {
+      cursor = await nextWorkingDayStart(connection, cursor, gridMinutes);
       continue;
     }
 
-    const blockMinutes = Math.min(remaining, minutesLeftToday);
-    const blockEnd = current.add(blockMinutes, "minute");
+    const blockMinutes = Math.min(remaining, usableMinutes);
+    const blockEnd = cursor.add(blockMinutes, "minute");
 
     blocks.push({
-      start: current.format("YYYY-MM-DD HH:mm:ss"),
+      start: cursor.format("YYYY-MM-DD HH:mm:ss"),
       end: blockEnd.format("YYYY-MM-DD HH:mm:ss"),
       durationMinutes: blockMinutes,
     });
 
     remaining -= blockMinutes;
-    current = blockEnd;
 
     if (remaining > 0) {
-      current = await nextWorkingDayStart(connection, current);
+      cursor = await nextWorkingDayStart(connection, cursor, gridMinutes);
     }
   }
 
@@ -337,7 +389,20 @@ export async function getExistingBlocksForUserFromDate(
   fromDate: string,
   ignoreOrderId?: number,
   ignoreBlockId?: number
-) {
+): Promise<ExistingBusyBlock[]> {
+  const conditions = ["user_id = ?", "block_end >= ?"];
+  const params: Array<number | string> = [userId, `${fromDate} 00:00:00`];
+
+  if (ignoreOrderId) {
+    conditions.push("order_id != ?");
+    params.push(ignoreOrderId);
+  }
+
+  if (ignoreBlockId) {
+    conditions.push("id != ?");
+    params.push(ignoreBlockId);
+  }
+
   const [rows] = await connection.query<ExistingBlockRow[]>(
     `
       SELECT
@@ -351,18 +416,10 @@ export async function getExistingBlocksForUserFromDate(
         source,
         notes
       FROM schedule_blocks
-      WHERE user_id = ?
-        AND block_end >= ?
-        ${ignoreOrderId ? "AND order_id != ?" : ""}
-        ${ignoreBlockId ? "AND id != ?" : ""}
+      WHERE ${conditions.join(" AND ")}
       ORDER BY block_start ASC
     `,
-    [
-      userId,
-      `${fromDate} 00:00:00`,
-      ...(ignoreOrderId ? [ignoreOrderId] : []),
-      ...(ignoreBlockId ? [ignoreBlockId] : []),
-    ]
+    params
   );
 
   return rows.map((row) => ({
@@ -376,37 +433,6 @@ export async function getExistingBlocksForUserFromDate(
     source: row.source,
     notes: row.notes,
   }));
-}
-
-export async function assertNoConflicts(
-  connection: PoolConnection,
-  userId: number,
-  blocks: PlannedBlock[],
-  ignoreOrderId?: number,
-  ignoreBlockId?: number
-) {
-  if (!blocks.length) return;
-
-  const existing = await getExistingBlocksForUserFromDate(
-    connection,
-    userId,
-    dayjs(blocks[0].start).format("YYYY-MM-DD"),
-    ignoreOrderId,
-    ignoreBlockId
-  );
-
-  for (const block of blocks) {
-    const start = dayjs(block.start);
-    const end = dayjs(block.end);
-
-    for (const busy of existing) {
-      if (overlaps(start, end, busy.start, busy.end)) {
-        throw new Error(
-          "Konflikt: Mitarbeiter:in ist in diesem Zeitraum bereits verplant."
-        );
-      }
-    }
-  }
 }
 
 export async function syncOrderPlanningFields(
@@ -442,73 +468,54 @@ export async function syncOrderPlanningFields(
         estimated_duration_minutes = ?
       WHERE id = ?
     `,
-    [
-      row?.planned_start ?? null,
-      row?.planned_end ?? null,
-      row?.total_minutes ?? 0,
-      orderId,
-    ]
+    [row?.planned_start ?? null, row?.planned_end ?? null, row?.total_minutes ?? 0, orderId]
   );
 }
 
-export async function createOrderBlocks(
-  connection: PoolConnection,
-  params: {
-    orderId: number;
-    userId: number;
-    taskTypeId?: number | null;
-    start: string;
-    durationMinutes: number;
-    source?: "manual" | "auto";
-    status?: "geplant" | "in_arbeit" | "pausiert" | "erledigt";
-    notes?: string | null;
-  }
-) {
-  const {
-    orderId,
-    userId,
-    taskTypeId,
-    start,
-    durationMinutes,
-    source = "auto",
-    status = "geplant",
-    notes = null,
-  } = params;
+function buildAdjustmentMessage(args: {
+  reason: SlotSearchResult["adjustmentReason"];
+  actualStart: Dayjs;
+  exceptionName?: string;
+}) {
+  const { reason, actualStart, exceptionName } = args;
 
-  const blocks = await splitIntoWorkingBlocks(connection, start, durationMinutes);
-
-  await assertNoConflicts(connection, userId, blocks);
-
-  for (const block of blocks) {
-    await connection.query(
-      `
-        INSERT INTO schedule_blocks (
-          order_id,
-          user_id,
-          task_type_id,
-          block_start,
-          block_end,
-          status,
-          source,
-          notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        orderId,
-        userId,
-        taskTypeId ?? null,
-        block.start,
-        block.end,
-        status,
-        source,
-        notes,
-      ]
-    );
+  if (reason === "holiday" && exceptionName) {
+    return `Der gewünschte Tag ist wegen „${exceptionName}“ nicht verfügbar. Geplant wurde stattdessen ab ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
   }
 
-  await syncOrderPlanningFields(connection, orderId);
+  if (reason === "closed_day") {
+    return `Der gewünschte Tag ist kein Arbeitstag. Geplant wurde stattdessen ab ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
+  }
 
-  return blocks;
+  if (reason === "after_hours") {
+    return `Der gewünschte Zeitpunkt liegt außerhalb der Öffnungszeiten. Geplant wurde stattdessen ab ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
+  }
+
+  if (reason === "conflict") {
+    return `Der gewünschte Slot war bereits belegt. Geplant wurde der nächste freie Zeitpunkt ab ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
+  }
+
+  if (reason === "same_day_shifted") {
+    return `Der gewünschte Start wurde an die Arbeitszeiten angepasst: ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
+  }
+
+  if (reason === "grid_aligned") {
+    return `Der gewünschte Start wurde auf das 15-Minuten-Raster angepasst: ${actualStart.format(
+      "DD.MM.YYYY HH:mm"
+    )}.`;
+  }
+
+  return null;
 }
 
 export async function findNextAvailableSlot(params: {
@@ -516,29 +523,65 @@ export async function findNextAvailableSlot(params: {
   userId: number;
   durationMinutes: number;
   startDate: string;
-}) {
-  const { connection, userId, durationMinutes, startDate } = params;
+  requestedStart?: string;
+  gridMinutes?: number;
+}): Promise<SlotSearchResult> {
+  const {
+    connection,
+    userId,
+    durationMinutes,
+    startDate,
+    requestedStart,
+    gridMinutes = DEFAULT_GRID_MINUTES,
+  } = params;
 
   if (!durationMinutes || durationMinutes <= 0) {
     throw new Error("Ungültige Dauer.");
   }
 
-  const existing = await getExistingBlocksForUserFromDate(
-    connection,
-    userId,
-    startDate
-  );
+  const requested = requestedStart
+    ? dayjs(requestedStart)
+    : dayjs(`${startDate} ${DEFAULT_WORK_START}`);
 
-  let cursor = await normalizeToWorkingTime(
-    connection,
-    dayjs(`${startDate} ${String(WORK_START_HOUR).padStart(2, "0")}:00:00`)
-  );
+  if (!requested.isValid()) {
+    throw new Error("Ungültiger gewünschter Start.");
+  }
 
-  for (let i = 0; i < 366; i++) {
+  const gridAlignedRequested = snapToTimeGrid(requested, gridMinutes, "ceil");
+  const originalConfig = await getEffectiveWorkdayConfig(connection, requested);
+  const normalizedRequestedStart = await normalizeToWorkingTime(
+    connection,
+    gridAlignedRequested,
+    gridMinutes
+  );
+  const existing = await getExistingBlocksForUserFromDate(connection, userId, startDate);
+
+  let cursor = normalizedRequestedStart;
+  let adjustmentReason: SlotSearchResult["adjustmentReason"] = null;
+
+  if (!requested.isSame(gridAlignedRequested)) {
+    adjustmentReason = "grid_aligned";
+  }
+
+  if (!originalConfig.isWorkingDay) {
+    adjustmentReason =
+      originalConfig.source === "exception" && originalConfig.exceptionType === "holiday"
+        ? "holiday"
+        : "closed_day";
+  } else if (originalConfig.workStart && requested.isBefore(originalConfig.workStart)) {
+    adjustmentReason = "same_day_shifted";
+  } else if (originalConfig.workEnd && !requested.isBefore(originalConfig.workEnd)) {
+    adjustmentReason = "after_hours";
+  } else if (!requested.isSame(normalizedRequestedStart)) {
+    adjustmentReason = adjustmentReason ?? "same_day_shifted";
+  }
+
+  for (let i = 0; i < MAX_SEARCH_DAYS; i++) {
     const tentativeBlocks = await splitIntoWorkingBlocks(
       connection,
       cursor,
-      durationMinutes
+      durationMinutes,
+      gridMinutes
     );
 
     const hasConflict = tentativeBlocks.some((block) => {
@@ -549,10 +592,23 @@ export async function findNextAvailableSlot(params: {
     });
 
     if (!hasConflict) {
+      const actualStart = dayjs(tentativeBlocks[0].start);
+      const actualEnd = dayjs(tentativeBlocks[tentativeBlocks.length - 1].end);
+
       return {
-        start: tentativeBlocks[0].start,
-        end: tentativeBlocks[tentativeBlocks.length - 1].end,
+        requestedStart: requested.format("YYYY-MM-DD HH:mm:ss"),
+        normalizedRequestedStart: normalizedRequestedStart.format("YYYY-MM-DD HH:mm:ss"),
+        actualStart: actualStart.format("YYYY-MM-DD HH:mm:ss"),
+        actualEnd: actualEnd.format("YYYY-MM-DD HH:mm:ss"),
         blocks: tentativeBlocks,
+        adjusted:
+          !actualStart.isSame(requested) || !normalizedRequestedStart.isSame(requested),
+        adjustmentReason,
+        adjustmentMessage: buildAdjustmentMessage({
+          reason: adjustmentReason,
+          actualStart,
+          exceptionName: originalConfig.exceptionName,
+        }),
       };
     }
 
@@ -566,119 +622,11 @@ export async function findNextAvailableSlot(params: {
       break;
     }
 
-    cursor = await normalizeToWorkingTime(connection, conflictingBlock.end);
+    adjustmentReason = "conflict";
+    cursor = await normalizeToWorkingTime(connection, conflictingBlock.end, gridMinutes);
   }
 
   throw new Error("Kein freier Slot gefunden.");
-}
-
-export async function rescheduleOrder(
-  connection: PoolConnection,
-  params: {
-    orderId: number;
-    userId: number;
-    start: string;
-    durationMinutes: number;
-    taskTypeId?: number;
-    notes?: string | null;
-  }
-) {
-  const { orderId, userId, start, durationMinutes, taskTypeId, notes = null } = params;
-
-  const blocks = await splitIntoWorkingBlocks(connection, start, durationMinutes);
-
-  await assertNoConflicts(connection, userId, blocks, orderId);
-
-  await connection.query(`DELETE FROM schedule_blocks WHERE order_id = ?`, [orderId]);
-
-  for (const block of blocks) {
-    await connection.query(
-      `
-        INSERT INTO schedule_blocks (
-          order_id,
-          user_id,
-          task_type_id,
-          block_start,
-          block_end,
-          status,
-          source,
-          notes
-        ) VALUES (?, ?, ?, ?, ?, 'geplant', 'auto', ?)
-      `,
-      [
-        orderId,
-        userId,
-        taskTypeId ?? null,
-        block.start,
-        block.end,
-        notes,
-      ]
-    );
-  }
-
-  await connection.query(
-    `
-      UPDATE order_assignments
-      SET is_primary = CASE WHEN user_id = ? THEN 1 ELSE 0 END
-      WHERE order_id = ?
-    `,
-    [userId, orderId]
-  );
-
-  const [assignmentRows] = await connection.query<(RowDataPacket & { cnt: number })[]>(
-    `
-      SELECT COUNT(*) AS cnt
-      FROM order_assignments
-      WHERE order_id = ? AND user_id = ?
-    `,
-    [orderId, userId]
-  );
-
-  if (!assignmentRows[0] || assignmentRows[0].cnt === 0) {
-    await connection.query(
-      `
-        INSERT INTO order_assignments (order_id, user_id, role_label, is_primary)
-        VALUES (?, ?, 'zuständig', 1)
-      `,
-      [orderId, userId]
-    );
-  }
-
-  if (taskTypeId) {
-    const [taskTypeRows] = await connection.query<(RowDataPacket & { cnt: number })[]>(
-      `
-        SELECT COUNT(*) AS cnt
-        FROM order_task_types
-        WHERE order_id = ? AND task_type_id = ?
-      `,
-      [orderId, taskTypeId]
-    );
-
-    if (!taskTypeRows[0] || taskTypeRows[0].cnt === 0) {
-      await connection.query(`DELETE FROM order_task_types WHERE order_id = ?`, [orderId]);
-
-      await connection.query(
-        `
-          INSERT INTO order_task_types (order_id, task_type_id, estimated_duration_minutes)
-          VALUES (?, ?, ?)
-        `,
-        [orderId, taskTypeId, durationMinutes]
-      );
-    } else {
-      await connection.query(
-        `
-          UPDATE order_task_types
-          SET estimated_duration_minutes = ?
-          WHERE order_id = ? AND task_type_id = ?
-        `,
-        [durationMinutes, orderId, taskTypeId]
-      );
-    }
-  }
-
-  await syncOrderPlanningFields(connection, orderId);
-
-  return blocks;
 }
 
 export async function moveScheduleBlockWithRules(
@@ -687,84 +635,124 @@ export async function moveScheduleBlockWithRules(
     blockId: number;
     userId: number;
     newStart: string;
+    gridMinutes?: number;
   }
-) {
-  const { blockId, userId, newStart } = params;
+): Promise<CalendarBlock> {
+  const gridMinutes = params.gridMinutes ?? DEFAULT_GRID_MINUTES;
 
   const [rows] = await connection.query<
     (RowDataPacket & {
       id: number;
-      order_id: number;
-      user_id: number;
-      task_type_id: number | null;
-      block_start: string;
-      block_end: string;
-      status: "geplant" | "in_arbeit" | "pausiert" | "erledigt";
-      source: "manual" | "auto";
-      notes: string | null;
+      block_start: string | Date;
+      block_end: string | Date;
     })[]
   >(
     `
-      SELECT *
+      SELECT id, block_start, block_end
       FROM schedule_blocks
       WHERE id = ?
       LIMIT 1
     `,
-    [blockId]
+    [params.blockId]
   );
 
-  const block = rows[0];
-
-  if (!block) {
-    throw new Error("Block nicht gefunden.");
+  if (rows.length === 0) {
+    throw new Error("Kalenderblock nicht gefunden.");
   }
 
-  const originalStart = dayjs(block.block_start);
-  const originalEnd = dayjs(block.block_end);
-  const durationMinutes = originalEnd.diff(originalStart, "minute");
+  const currentBlock = rows[0];
+  const oldStart = dayjs(currentBlock.block_start);
+  const oldEnd = dayjs(currentBlock.block_end);
+  const durationMinutes = oldEnd.diff(oldStart, "minute");
 
   if (durationMinutes <= 0) {
     throw new Error("Ungültige Blockdauer.");
   }
 
-  const normalizedStart = await normalizeToWorkingTime(connection, dayjs(newStart));
-  const tentativeBlocks = await splitIntoWorkingBlocks(
-    connection,
-    normalizedStart,
-    durationMinutes
-  );
+  let newStart = dayjs(params.newStart);
 
-  if (tentativeBlocks.length !== 1) {
-    throw new Error(
-      "Ein einzelner Block kann nicht über mehrere Arbeitstage verschoben werden."
-    );
+  if (!newStart.isValid()) {
+    throw new Error("Ungültiger neuer Startzeitpunkt.");
   }
 
-  await assertNoConflicts(connection, userId, tentativeBlocks, undefined, blockId);
+  newStart = snapToTimeGrid(newStart, gridMinutes, "floor")
+    .second(0)
+    .millisecond(0);
 
-  const movedBlock = tentativeBlocks[0];
+  const newEnd = newStart.add(durationMinutes, "minute");
+  const workday = await getEffectiveWorkdayConfig(connection, newStart);
 
-  await connection.query(
+  if (!workday.isWorkingDay || !workday.workStart || !workday.workEnd) {
+    throw new Error("An diesem Tag kann nicht eingeplant werden.");
+  }
+
+  if (
+    !newStart.isSame(workday.workStart, "day") ||
+    !newEnd.isSame(workday.workStart, "day")
+  ) {
+    throw new Error("Ein Block darf beim Verschieben nicht auf den nächsten Tag ragen.");
+  }
+
+  if (newStart.isBefore(workday.workStart) || newEnd.isAfter(workday.workEnd)) {
+    throw new Error("Der Block liegt außerhalb der gültigen Arbeitszeit.");
+  }
+
+  const [conflicts] = await connection.query<RowDataPacket[]>(
     `
-      UPDATE schedule_blocks
-      SET
-        user_id = ?,
-        block_start = ?,
-        block_end = ?,
-        source = 'manual'
-      WHERE id = ?
+      SELECT id
+      FROM schedule_blocks
+      WHERE user_id = ?
+        AND id <> ?
+        AND block_start < ?
+        AND block_end > ?
+      LIMIT 1
     `,
-    [userId, movedBlock.start, movedBlock.end, blockId]
+    [
+      params.userId,
+      params.blockId,
+      newEnd.format("YYYY-MM-DD HH:mm:ss"),
+      newStart.format("YYYY-MM-DD HH:mm:ss"),
+    ]
   );
 
-  await syncOrderPlanningFields(connection, block.order_id);
+  if (conflicts.length > 0) {
+    throw new Error("Konflikt: Diese Person ist in diesem Zeitraum bereits eingeplant.");
+  }
 
-  return {
-    id: blockId,
-    orderId: block.order_id,
-    userId,
-    start: movedBlock.start,
-    end: movedBlock.end,
-    durationMinutes,
-  };
+  const [result] = await connection.query<ResultSetHeader>(
+    `
+      UPDATE schedule_blocks
+      SET user_id = ?,
+          block_start = ?,
+          block_end = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `,
+    [
+      params.userId,
+      newStart.format("YYYY-MM-DD HH:mm:ss"),
+      newEnd.format("YYYY-MM-DD HH:mm:ss"),
+      params.blockId,
+    ]
+  );
+
+  if (result.affectedRows !== 1) {
+    throw new Error("Kalenderblock konnte nicht aktualisiert werden.");
+  }
+
+  const [movedRows] = await connection.query<RowDataPacket[]>(
+    `
+      SELECT *
+      FROM v_calendar_blocks
+      WHERE schedule_block_id = ?
+      LIMIT 1
+    `,
+    [params.blockId]
+  );
+
+  if (movedRows.length === 0) {
+    throw new Error("Aktualisierter Kalenderblock konnte nicht geladen werden.");
+  }
+
+  return movedRows[0] as CalendarBlock;
 }

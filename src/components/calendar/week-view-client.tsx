@@ -55,6 +55,26 @@ type DayGroup = {
   exception: CalendarException | null;
 };
 
+type WeekBlockSegment = {
+  block: CalendarBlock;
+  dayKey: string;
+  segmentStart: string;
+  segmentEnd: string;
+  startsToday: boolean;
+  endsToday: boolean;
+  lane: number;
+  laneCount: number;
+};
+
+const START_HOUR = 8;
+const END_HOUR = 17;
+const SLOT_MINUTES = 15;
+const PIXELS_PER_MINUTE = 1.1;
+const MIN_BLOCK_HEIGHT = 54;
+const TOTAL_MINUTES = (END_HOUR - START_HOUR) * 60;
+const TOTAL_SLOTS = TOTAL_MINUTES / SLOT_MINUTES;
+const CALENDAR_HEIGHT = TOTAL_MINUTES * PIXELS_PER_MINUTE;
+
 function formatHourLabel(start: string, end: string) {
   return `${dayjs(start).format("HH:mm")}–${dayjs(end).format("HH:mm")}`;
 }
@@ -80,6 +100,15 @@ function getExceptionStyle(exception: CalendarException | null) {
   };
 }
 
+function getMinutesFromCalendarStart(value: string) {
+  const d = dayjs(value);
+  return (d.hour() - START_HOUR) * 60 + d.minute();
+}
+
+function clampMinutesToCalendar(minutes: number) {
+  return Math.max(0, Math.min(minutes, TOTAL_MINUTES));
+}
+
 function groupBlocksByDay(
   blocks: CalendarBlock[],
   weekStart: string,
@@ -95,9 +124,15 @@ function groupBlocksByDay(
 
   return days.map((day) => {
     const dayKey = day.format("YYYY-MM-DD");
+    const dayStart = day.startOf("day");
+    const dayEnd = day.add(1, "day").startOf("day");
 
     const dayBlocks = blocks
-      .filter((block) => dayjs(block.block_start).format("YYYY-MM-DD") === dayKey)
+      .filter((block) => {
+        const blockStart = dayjs(block.block_start);
+        const blockEnd = dayjs(block.block_end);
+        return blockStart.isBefore(dayEnd) && blockEnd.isAfter(dayStart);
+      })
       .sort((a, b) => dayjs(a.block_start).unix() - dayjs(b.block_start).unix());
 
     return {
@@ -110,14 +145,99 @@ function groupBlocksByDay(
 }
 
 function parseDropCellId(value: string) {
-  const match = /^week-cell-(\d+)-(\d{4}-\d{2}-\d{2})-(\d{2})$/.exec(value);
+  const match =
+    /^week-cell-(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})$/.exec(value);
 
   if (!match) return null;
 
   return {
-    userId: Number(match[1]),
-    targetDate: match[2],
-    hour: Number(match[3]),
+    targetDate: match[1],
+    hour: Number(match[2]),
+    minute: Number(match[3]),
+  };
+}
+
+function buildWeekSegments(day: DayGroup): WeekBlockSegment[] {
+  const dayStart = day.date.hour(START_HOUR).minute(0).second(0).millisecond(0);
+  const dayEnd = day.date.hour(END_HOUR).minute(0).second(0).millisecond(0);
+
+  const rawSegments = day.blocks
+    .map((block) => {
+      const blockStart = dayjs(block.block_start);
+      const blockEnd = dayjs(block.block_end);
+
+      const segmentStart = blockStart.isAfter(dayStart) ? blockStart : dayStart;
+      const segmentEnd = blockEnd.isBefore(dayEnd) ? blockEnd : dayEnd;
+
+      if (!segmentEnd.isAfter(segmentStart)) return null;
+
+      return {
+        block,
+        dayKey: day.key,
+        segmentStart: segmentStart.format("YYYY-MM-DD HH:mm:ss"),
+        segmentEnd: segmentEnd.format("YYYY-MM-DD HH:mm:ss"),
+        startsToday: blockStart.isSame(segmentStart),
+        endsToday: blockEnd.isSame(segmentEnd),
+      };
+    })
+    .filter((item): item is Omit<WeekBlockSegment, "lane" | "laneCount"> => !!item)
+    .sort(
+      (a, b) =>
+        dayjs(a.segmentStart).valueOf() - dayjs(b.segmentStart).valueOf()
+    );
+
+  const laneEndTimes: dayjs.Dayjs[] = [];
+  const itemsWithLane: WeekBlockSegment[] = rawSegments.map((segment) => {
+    const start = dayjs(segment.segmentStart);
+    const end = dayjs(segment.segmentEnd);
+
+    let lane = laneEndTimes.findIndex((laneEnd) => !laneEnd.isAfter(start));
+
+    if (lane === -1) {
+      lane = laneEndTimes.length;
+      laneEndTimes.push(end);
+    } else {
+      laneEndTimes[lane] = end;
+    }
+
+    return {
+      ...segment,
+      lane,
+      laneCount: 1,
+    };
+  });
+
+  const maxLane = itemsWithLane.reduce(
+    (max, item) => Math.max(max, item.lane),
+    0
+  );
+  const laneCount = itemsWithLane.length > 0 ? maxLane + 1 : 1;
+
+  return itemsWithLane.map((item) => ({
+    ...item,
+    laneCount,
+  }));
+}
+
+function getSegmentStyle(segment: WeekBlockSegment) {
+  const rawTop = getMinutesFromCalendarStart(segment.segmentStart);
+  const rawBottom =
+    getMinutesFromCalendarStart(segment.segmentStart) +
+    dayjs(segment.segmentEnd).diff(dayjs(segment.segmentStart), "minute");
+
+  const topMinutes = clampMinutesToCalendar(rawTop);
+  const bottomMinutes = clampMinutesToCalendar(rawBottom);
+  const renderedDuration = Math.max(bottomMinutes - topMinutes, 0);
+
+  const gap = 6;
+  const width = `calc((100% - ${(segment.laneCount - 1) * gap}px) / ${segment.laneCount})`;
+  const left = `calc(${segment.lane} * (${width} + ${gap}px))`;
+
+  return {
+    top: `${topMinutes * PIXELS_PER_MINUTE}px`,
+    height: `${Math.max(renderedDuration * PIXELS_PER_MINUTE, MIN_BLOCK_HEIGHT)}px`,
+    left,
+    width,
   };
 }
 
@@ -205,12 +325,13 @@ function WeekMobileBlockCard({
 }
 
 function DesktopWeekBlockCard({
-  block,
+  segment,
   onOpen,
 }: {
-  block: CalendarBlock;
+  segment: WeekBlockSegment;
   onOpen: (block: CalendarBlock) => void;
 }) {
+  const block = segment.block;
   const { attributes, listeners, setNodeRef, transform, isDragging } =
     useDraggable({
       id: `week-block-${block.schedule_block_id}`,
@@ -222,29 +343,26 @@ function DesktopWeekBlockCard({
     userName: block.user_name,
   });
 
-  const style = transform
+  const dragStyle = transform
     ? {
         transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
-        borderColor: employeeTheme.border,
       }
-    : {
-        borderColor: employeeTheme.border,
-      };
+    : undefined;
 
   return (
     <div
       ref={setNodeRef}
-      style={style}
+      style={dragStyle}
       {...attributes}
       {...listeners}
-      className={`relative cursor-grab rounded-[22px] border bg-white p-3 text-left shadow-sm active:cursor-grabbing ${
+      className={`absolute cursor-grab overflow-hidden rounded-[20px] border bg-white p-3 text-left shadow-sm active:cursor-grabbing ${
         isDragging ? "opacity-50" : ""
       }`}
       onDoubleClick={() => onOpen(block)}
       aria-label={`${block.title} verschieben`}
     >
       <div
-        className="absolute bottom-0 left-0 top-0 w-1.5 rounded-l-[22px]"
+        className="absolute bottom-0 left-0 top-0 w-1.5 rounded-l-[20px]"
         style={{ backgroundColor: employeeTheme.solid }}
       />
 
@@ -254,8 +372,11 @@ function DesktopWeekBlockCard({
           e.stopPropagation();
           onOpen(block);
         }}
-        className="relative block w-full min-w-0 pl-2 text-left"
-      >
+        className="absolute inset-0 z-0"
+        aria-label={`Details zu ${block.title} öffnen`}
+      />
+
+      <div className="pointer-events-none relative z-10 flex h-full min-h-0 flex-col pl-2">
         <div className="mb-1 flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-slate-900">
@@ -267,46 +388,53 @@ function DesktopWeekBlockCard({
           </div>
 
           <div className="shrink-0 text-[11px] font-medium text-slate-500">
-            {formatHourLabel(block.block_start, block.block_end)}
+            {dayjs(segment.segmentStart).format("HH:mm")}–
+            {dayjs(segment.segmentEnd).format("HH:mm")}
           </div>
         </div>
 
-        <CleanWeekMetaLine block={block} />
-
-        <div className="mt-2 text-[11px] text-slate-400">
-          {formatHours(block.block_duration_minutes)}
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <CleanWeekMetaLine block={block} />
         </div>
-      </button>
+
+        <div className="mt-2 flex flex-wrap gap-2 text-[10px] text-slate-400">
+          {!segment.startsToday ? (
+            <span className="rounded-full bg-slate-50 px-2 py-0.5">
+              Fortsetzung
+            </span>
+          ) : null}
+          {!segment.endsToday ? (
+            <span className="rounded-full bg-slate-50 px-2 py-0.5">
+              läuft weiter
+            </span>
+          ) : null}
+          <span>{formatHours(dayjs(segment.segmentEnd).diff(dayjs(segment.segmentStart), "minute"))}</span>
+        </div>
+      </div>
     </div>
   );
 }
 
 function DropSlot({
   id,
-  label,
-  userName,
-  userId,
+  top,
 }: {
   id: string;
-  label: string;
-  userName: string;
-  userId: number;
+  top: number;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
-  const theme = getEmployeeTheme({ userId, userName });
 
   return (
     <div
       ref={setNodeRef}
-      className="rounded-2xl border border-dashed px-3 py-2 text-xs transition"
+      className={`absolute left-0 right-0 transition-colors ${
+        isOver ? "bg-sky-50/70" : ""
+      }`}
       style={{
-        borderColor: isOver ? theme.solid : theme.border,
-        backgroundColor: isOver ? theme.soft : "#ffffff",
-        color: isOver ? theme.text : "#64748b",
+        top: `${top}px`,
+        height: `${SLOT_MINUTES * PIXELS_PER_MINUTE}px`,
       }}
-    >
-      {label}
-    </div>
+    />
   );
 }
 
@@ -382,6 +510,25 @@ export function WeekViewClient({
     [filteredBlocks, weekStart, exceptions]
   );
 
+  const slots = useMemo(
+    () =>
+      Array.from({ length: TOTAL_SLOTS }, (_, index) => {
+        const minutesFromStart = index * SLOT_MINUTES;
+        const hour = START_HOUR + Math.floor(minutesFromStart / 60);
+        const minute = minutesFromStart % 60;
+        const top = minutesFromStart * PIXELS_PER_MINUTE;
+
+        return {
+          index,
+          hour,
+          minute,
+          top,
+          isHourLine: minute === 0,
+        };
+      }),
+    []
+  );
+
   const userLoad = useMemo(() => {
     return users.map((user) => {
       const userBlocks = blocks.filter((block) => block.user_id === user.id);
@@ -420,7 +567,9 @@ export function WeekViewClient({
     if (!parsed) return;
 
     const newStart = dayjs(
-      `${parsed.targetDate} ${String(parsed.hour).padStart(2, "0")}:00:00`
+      `${parsed.targetDate} ${String(parsed.hour).padStart(2, "0")}:${String(
+        parsed.minute
+      ).padStart(2, "0")}:00`
     ).format("YYYY-MM-DD HH:mm:ss");
 
     try {
@@ -434,7 +583,7 @@ export function WeekViewClient({
         },
         body: JSON.stringify({
           blockId: block.schedule_block_id,
-          userId: parsed.userId,
+          userId: block.user_id,
           start: newStart,
         }),
       });
@@ -563,7 +712,7 @@ export function WeekViewClient({
         </div>
       </section>
 
-      <div className="grid gap-4 lg:hidden">
+      <div className="grid gap-4 md:grid-cols-2 xl:hidden">
         {filteredDays.map((day) => {
           const styles = getExceptionStyle(day.exception);
 
@@ -596,7 +745,7 @@ export function WeekViewClient({
                 <div className="space-y-3">
                   {day.blocks.map((block) => (
                     <WeekMobileBlockCard
-                      key={block.schedule_block_id}
+                      key={`${day.key}-${block.schedule_block_id}`}
                       block={block}
                       onOpen={setSelectedBlock}
                     />
@@ -613,54 +762,113 @@ export function WeekViewClient({
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
-        <section className="hidden rounded-[30px] border bg-white p-4 shadow-sm lg:block lg:p-6">
+        <section className="hidden rounded-[30px] border bg-white p-4 shadow-sm xl:block xl:p-6">
+          <div className="mb-4 rounded-2xl bg-slate-50 px-4 py-3 text-sm text-slate-600">
+            Desktop jetzt mit echter Zeitskalierung und 15-Minuten-Raster.
+          </div>
+
           <div className="overflow-x-auto">
-            <div className="grid min-w-[1200px] grid-cols-6 gap-4">
+            <div
+              className="grid min-w-[1280px]"
+              style={{
+                gridTemplateColumns: `80px repeat(${filteredDays.length}, minmax(180px, 1fr))`,
+              }}
+            >
+              <div className="border-r border-b bg-slate-50 px-3 py-3 text-sm font-medium text-slate-500">
+                Zeit
+              </div>
+
               {filteredDays.map((day) => {
                 const styles = getExceptionStyle(day.exception);
 
                 return (
-                  <div key={day.key} className="min-w-0">
-                    <div className={`mb-3 rounded-[22px] bg-slate-50 px-4 py-3 ${styles.dayClass}`}>
-                      <div className="text-sm font-semibold text-slate-900">
-                        {day.date.format("dddd")}
-                      </div>
-                      <div className="text-xs text-slate-500">
-                        {day.date.format("DD.MM.YYYY")}
-                      </div>
-                      <div className="mt-1 text-[11px] font-medium text-slate-500">
-                        {day.blocks.length} Block{day.blocks.length === 1 ? "" : "e"}
-                      </div>
-
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <ExceptionBadge exception={day.exception} />
-                      </div>
+                  <div
+                    key={`header-${day.key}`}
+                    className={`border-b border-r bg-white px-4 py-3 ${styles.dayClass}`}
+                  >
+                    <div className="text-sm font-semibold text-slate-900">
+                      {day.date.format("dddd")}
                     </div>
+                    <div className="text-xs text-slate-500">
+                      {day.date.format("DD.MM.YYYY")}
+                    </div>
+                    <div className="mt-2 text-[11px] font-medium text-slate-500">
+                      {day.blocks.length} Block{day.blocks.length === 1 ? "" : "e"}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <ExceptionBadge exception={day.exception} />
+                    </div>
+                  </div>
+                );
+              })}
 
-                    <div className="mb-3 grid gap-2">
-                      {users.map((user) => (
+              <div className="relative border-r bg-white">
+                <div style={{ height: `${CALENDAR_HEIGHT}px` }}>
+                  {slots.map((slot) => (
+                    <div
+                      key={`time-${slot.index}`}
+                      className={`absolute left-0 right-0 ${
+                        slot.isHourLine
+                          ? "border-t border-slate-200"
+                          : "border-t border-slate-100/70"
+                      }`}
+                      style={{ top: `${slot.top}px` }}
+                    >
+                      {slot.isHourLine ? (
+                        <div className="-translate-y-1/2 px-2 text-xs text-slate-400">
+                          {String(slot.hour).padStart(2, "0")}:00
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {filteredDays.map((day) => {
+                const segments = buildWeekSegments(day);
+
+                return (
+                  <div key={day.key} className="relative border-r bg-white">
+                    <div className="relative" style={{ height: `${CALENDAR_HEIGHT}px` }}>
+                      {slots.map((slot) => (
                         <DropSlot
-                          key={`${day.key}-${user.id}`}
-                          id={`week-cell-${user.id}-${day.key}-08`}
-                          label={`${user.name} · 08:00`}
-                          userName={user.name}
-                          userId={user.id}
+                          key={`drop-${day.key}-${slot.index}`}
+                          id={`week-cell-${day.key}-${String(slot.hour).padStart(
+                            2,
+                            "0"
+                          )}-${String(slot.minute).padStart(2, "0")}`}
+                          top={slot.top}
                         />
                       ))}
-                    </div>
 
-                    <div className="space-y-3">
-                      {day.blocks.length === 0 ? (
-                        <div className="rounded-[22px] border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                      {slots.map((slot) => (
+                        <div
+                          key={`line-${day.key}-${slot.index}`}
+                          className={`absolute left-0 right-0 ${
+                            slot.isHourLine
+                              ? "border-t border-slate-100"
+                              : "border-t border-slate-100/60"
+                          }`}
+                          style={{ top: `${slot.top}px` }}
+                        />
+                      ))}
+
+                      {segments.length === 0 ? (
+                        <div className="absolute inset-x-3 top-3 rounded-[18px] border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-center text-xs text-slate-400">
                           Frei
                         </div>
                       ) : (
-                        day.blocks.map((block) => (
-                          <DesktopWeekBlockCard
-                            key={block.schedule_block_id}
-                            block={block}
-                            onOpen={setSelectedBlock}
-                          />
+                        segments.map((segment) => (
+                          <div
+                            key={`${segment.dayKey}-${segment.block.schedule_block_id}`}
+                            className="absolute"
+                            style={getSegmentStyle(segment)}
+                          >
+                            <DesktopWeekBlockCard
+                              segment={segment}
+                              onOpen={setSelectedBlock}
+                            />
+                          </div>
                         ))
                       )}
                     </div>

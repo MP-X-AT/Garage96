@@ -6,7 +6,6 @@ import { Topbar } from "@/components/app/topbar";
 import {
   getAllActiveUsers,
   getDayCalendarBlocks,
-  getTaskTypes,
   getWeekCalendarBlocks,
 } from "@/lib/calendar";
 import {
@@ -54,9 +53,8 @@ export default async function DashboardPage() {
   const week = dayjs().startOf("isoWeek").format("YYYY-MM-DD");
   const now = dayjs();
 
-  const [users, taskTypes, todayBlocks, weekBlocks] = await Promise.all([
+  const [users, todayBlocks, weekBlocks] = await Promise.all([
     getAllActiveUsers(),
-    getTaskTypes(),
     getDayCalendarBlocks(today),
     getWeekCalendarBlocks(week),
   ]);
